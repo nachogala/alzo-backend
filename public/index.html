@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>InnerVoice — Affirmations that sound like you</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="container">
+
+    <!-- ═══════ SCREEN 1: LANDING ═══════ -->
+    <div id="landing" class="screen landing active">
+      <div>
+        <div class="logo">🎙️</div>
+        <h1>Your voice. Your words.<br /><span>Every morning.</span></h1>
+      </div>
+      <p class="sub">The only affirmation app that sounds exactly like you.</p>
+      <button class="btn btn-primary" onclick="showScreen('goal')">
+        Try it free — hear your voice in 60 seconds
+      </button>
+    </div>
+
+    <!-- ═══════ SCREEN 2: GOAL INPUT ═══════ -->
+    <div id="goal" class="screen">
+      <span class="step-label">Step 1 of 2</span>
+      <h2>What do you want to achieve?</h2>
+      <p class="hint">Be specific. The more detail you give, the more powerful your affirmation will be.</p>
+      <textarea
+        id="goalInput"
+        placeholder="I want to build a successful app and achieve financial freedom by end of 2026"
+        maxlength="1000"
+      ></textarea>
+      <div class="mt-auto mt-2">
+        <button class="btn btn-primary" style="width:100%" onclick="goToVoice()">
+          Next — Record your voice
+        </button>
+      </div>
+    </div>
+
+    <!-- ═══════ SCREEN 3: VOICE RECORDING ═══════ -->
+    <div id="voice" class="screen">
+      <span class="step-label">Step 2 of 2</span>
+      <h2>Now let us hear your voice</h2>
+      <p class="hint">Read the text below aloud. We'll use your voice to personalize your affirmation.</p>
+
+      <div class="sample-text">
+        "I am someone who takes action every single day. I trust my ability to figure things out, even when the path is unclear. I speak with confidence. I move with purpose. I do not wait for permission to become the person I am meant to be. Today is not just another day — it is my opportunity to prove what I'm made of."
+      </div>
+
+      <div class="recorder-area">
+        <div class="record-timer" id="timer">0:00</div>
+        <button class="record-btn" id="recordBtn" onclick="toggleRecording()">
+          <svg id="micIcon" viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+          <svg id="stopIcon" style="display:none" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <div class="record-status" id="recordStatus">Tap to start recording</div>
+      </div>
+
+      <div class="mt-auto mt-2">
+        <button class="btn btn-primary" id="generateBtn" style="width:100%" onclick="generate()" disabled>
+          Generate my affirmation
+        </button>
+        <button class="btn btn-secondary mt-1" style="width:100%" onclick="skipVoice()">
+          Skip — just generate the text
+        </button>
+      </div>
+    </div>
+
+    <!-- ═══════ SCREEN 4: PROCESSING ═══════ -->
+    <div id="processing" class="screen processing">
+      <div class="spinner"></div>
+      <div>
+        <h2>Creating your affirmation...</h2>
+        <p class="mt-1" id="processingMsg">Analyzing your goals and crafting something powerful.</p>
+      </div>
+    </div>
+
+    <!-- ═══════ SCREEN 5: RESULT ═══════ -->
+    <div id="result" class="screen result">
+      <span class="step-label">Your affirmation</span>
+      <h2>Here's what your morning sounds like</h2>
+
+      <div id="audioSection" style="display:none">
+        <audio id="audioPlayer" controls></audio>
+      </div>
+
+      <div class="affirmation-card">
+        <p id="affirmationText"></p>
+      </div>
+
+      <div class="cta-final">
+        <p>Your daily affirmation is ready.<br />Get the app for daily delivery.</p>
+        <button class="btn btn-primary" onclick="showScreen('landing')">Start over</button>
+      </div>
+    </div>
+
+  </div>
+
+<script>
+// ── Screen navigation ────────────────────────────────
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+function goToVoice() {
+  const goal = document.getElementById('goalInput').value.trim();
+  if (!goal) {
+    document.getElementById('goalInput').focus();
+    return;
+  }
+  showScreen('voice');
+}
+
+// ── Voice recording ──────────────────────────────────
+let mediaRecorder = null;
+let audioChunks = [];
+let recordingBlob = null;
+let timerInterval = null;
+let seconds = 0;
+
+function updateTimer() {
+  seconds++;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  document.getElementById('timer').textContent = `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+async function toggleRecording() {
+  const btn = document.getElementById('recordBtn');
+  const status = document.getElementById('recordStatus');
+  const micIcon = document.getElementById('micIcon');
+  const stopIcon = document.getElementById('stopIcon');
+
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    // Stop
+    mediaRecorder.stop();
+    btn.classList.remove('recording');
+    micIcon.style.display = '';
+    stopIcon.style.display = 'none';
+    status.textContent = 'Recording saved. Ready to generate!';
+    clearInterval(timerInterval);
+    return;
+  }
+
+  // Start
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.onstop = () => {
+      recordingBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      document.getElementById('generateBtn').disabled = false;
+      stream.getTracks().forEach(t => t.stop());
+    };
+
+    mediaRecorder.start();
+    btn.classList.add('recording');
+    micIcon.style.display = 'none';
+    stopIcon.style.display = '';
+    status.textContent = 'Recording... tap to stop';
+    seconds = 0;
+    document.getElementById('timer').textContent = '0:00';
+    timerInterval = setInterval(updateTimer, 1000);
+  } catch (err) {
+    status.textContent = 'Microphone access denied. You can skip this step.';
+    console.error(err);
+  }
+}
+
+// ── Skip voice ───────────────────────────────────────
+function skipVoice() {
+  recordingBlob = null;
+  generate();
+}
+
+// ── Generate affirmation ─────────────────────────────
+async function generate() {
+  const goal = document.getElementById('goalInput').value.trim();
+  if (!goal) return;
+
+  showScreen('processing');
+
+  try {
+    const formData = new FormData();
+    formData.append('goal', goal);
+    if (recordingBlob) {
+      formData.append('voiceFile', recordingBlob, 'voice.webm');
+    }
+
+    const res = await fetch('/api/generate-affirmation', {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!res.ok) throw new Error('Server error');
+
+    const data = await res.json();
+
+    // Show result
+    document.getElementById('affirmationText').textContent = data.affirmationText;
+
+    const audioSection = document.getElementById('audioSection');
+    if (data.audioUrl) {
+      document.getElementById('audioPlayer').src = data.audioUrl;
+      audioSection.style.display = '';
+    } else {
+      audioSection.style.display = 'none';
+    }
+
+    showScreen('result');
+  } catch (err) {
+    console.error(err);
+    document.getElementById('processingMsg').textContent =
+      'Something went wrong. Please try again.';
+    setTimeout(() => showScreen('voice'), 2000);
+  }
+}
+</script>
+</body>
+</html>

@@ -8,7 +8,7 @@ const OpenAI = require("openai");
 const crypto = require("crypto");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
 
 // ── In-memory user store ────────────────────────────────────────────
 const users = new Map(); // email → { userId, email, passwordHash, token, streak, language, plan }

@@ -145,7 +145,8 @@ Style rules:
 - NEVER say: "universe", "manifest", "journey", "abundance", "vibration"
 - End with one specific action they take TODAY toward their goal
 
-CRITICAL LANGUAGE RULE: ${langInstruction} This is non-negotiable.`,
+CRITICAL LANGUAGE RULE: ${langInstruction} This is non-negotiable.
+Brand names: if you see 'also app', 'alzo app', or similar — it refers to 'ALZO' (the app). Keep brand names exactly as they appear logically.`,
       },
       {
         role: "user",

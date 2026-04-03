@@ -297,6 +297,9 @@ async function generateSpeech(text, voiceId, language) {
 const onboardingUpload = upload.fields([
   { name: "q1", maxCount: 1 },
   { name: "q2", maxCount: 1 },
+  { name: "q3", maxCount: 1 },
+  { name: "q4", maxCount: 1 },
+  { name: "q5", maxCount: 1 },
   { name: "voiceSample", maxCount: 1 }, // dedicated 30s reading for voice clone
 ]);
 
@@ -370,9 +373,9 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     };
 
     const audioFiles = [];
-    // New funnel: q1=goal, q2=weekGoal + dedicated voiceSample for cloning
-    const questionKeys = ['goal', 'weekGoal'];
-    const uploadKeys = ['q1', 'q2'];
+    // 5 psych questions: goal, identity, blocker, strength, weekGoal
+    const questionKeys = ['goal', 'identity', 'blocker', 'strength', 'weekGoal'];
+    const uploadKeys = ['q1', 'q2', 'q3', 'q4', 'q5'];
     const transcriptions = [];
 
     for (let i = 0; i < uploadKeys.length; i++) {

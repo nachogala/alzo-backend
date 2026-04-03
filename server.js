@@ -130,41 +130,32 @@ async function generateAffirmation(context, language) {
       {
         role: "system",
         content:
-          `You are a high-performance coach creating a daily spoken affirmation for ALZO — like a great coach speaking fire into their athlete before a game. Short, direct, energy-packed. You speak TO the person, not about them.
+          `You are a high-intensity personal coach delivering a daily spoken affirmation. You speak DIRECTLY to the person — second person. Like a great coach in the locker room before the game.
 
-Psychological principles you apply:
-- Self-affirmation theory: reinforce who they are becoming, not just what they want
-- Implementation intention: tie the affirmation to a concrete action TODAY
-- Inner critic reframe: if they named a blocker, acknowledge and crush it in one line
-- Strength anchoring: invoke their stated strength as the engine
+THE FORMULA (follow exactly):
+1. Say their name if you can extract it from their intro
+2. One sentence that defines who they are — specific, based on what they said
+3. One sentence connecting this week to their big dream — make it feel inevitable
+4. One action for TODAY — concrete, urgent
+5. A 3-5 word closing punch
 
-Style rules:
-- Address them directly ("You are...", "You have what it takes...", "Today you...")
-- Short punchy sentences. High energy. Coach voice.
-- Do NOT summarize their answers — use them as fuel, not content
-- NEVER say: "universe", "manifest", "journey", "abundance", "vibration"
-- End with one specific action they take TODAY toward their goal
+Example: "Nacho. You build things from zero. This week, launching ALZO is not a goal — it is inevitable. Today you make one move. Let's go."
 
-CRITICAL LANGUAGE RULE: ${langInstruction} This is non-negotiable.
-Brand names: if you see 'also app', 'alzo app', or similar — it refers to 'ALZO' (the app). Keep brand names exactly as they appear logically.`,
+RULES:
+- MAX 40 words total
+- SECOND PERSON only: "You are", "You have", "You can" — NEVER "I am"
+- High energy, short sentences, zero filler words
+- NEVER: "universe", "manifest", "journey", "abundance", "vibration"
+- Fix brand names: "also app" = "ALZO"
+
+CRITICAL LANGUAGE RULE: ${langInstruction} This is non-negotiable.`,
       },
       {
         role: "user",
-        content: `Generate a punchy, energetic 20-second spoken affirmation for this person:
-
+        content: `Person context:
 ${contextBlock}
 
-Rules:
-- LANGUAGE: ${langInstruction}
-- Write in first person, present tense
-- 50-70 words MAX — short, punchy, powerful
-- The affirmation must DIRECTLY reference their specific 90-day goal — make it the center
-- High energy, confident, like a coach firing them up before a game
-- No clichés (no "universe", "manifest", "journey") — real language
-- End with ONE clear action they take TODAY toward the goal
-- No title, no labels — just the spoken text
-
-REMINDER: ${langInstruction}`,
+Write the affirmation now. Follow the formula. Output only the spoken words. Language: ${langInstruction}`,
       },
     ],
     temperature: 0.8,
@@ -376,8 +367,8 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     };
 
     const audioFiles = [];
-    // v3 funnel: blocker (q1), vision (q2), goal90 (q3)
-    const questionKeys = ['blocker', 'vision', 'goal90'];
+    // v3 final: intro (q1=who you are), weekGoal (q2=this week), bigDream (q3=long term)
+    const questionKeys = ['intro', 'weekGoal', 'bigDream'];
     const uploadKeys = ['q1', 'q2', 'q3'];
     const transcriptions = [];
 

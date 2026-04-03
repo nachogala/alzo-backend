@@ -493,9 +493,8 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`ALZO server running on http://localhost:${PORT}`);
-  console.log(
-    `ElevenLabs: ${ELEVENLABS_API_KEY ? "enabled" : "disabled (text-only mode)"}`
-  );
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`ALZO server running on port ${PORT}`);
+  console.log(`ElevenLabs: ${ELEVENLABS_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`OpenAI: ${process.env.OPENAI_API_KEY ? 'enabled' : 'MISSING'}`);
 });

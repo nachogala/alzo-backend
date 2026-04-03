@@ -107,15 +107,15 @@ const WHISPER_LANGUAGE = {
 };
 
 async function generateAffirmation(context, language) {
-  const { goal, mood, identity, blocker, strength, gratitude, selfMessage, weeklyGoal } = context;
+  const { goal, goal90, mood, identity, blocker, vision, strength, gratitude, selfMessage, weeklyGoal, weekFocus } = context;
 
   const contextBlock = [
-    weeklyGoal && `⭐ THIS WEEK'S FOCUS (build the affirmation around this): ${weeklyGoal}`,
-    goal && `90-day goal: ${goal}`,
+    (weeklyGoal || weekFocus) && `⭐ THIS WEEK'S FOCUS (center the affirmation here): ${weeklyGoal || weekFocus}`,
+    (goal90 || goal) && `90-day goal: ${goal90 || goal}`,
+    vision && `What changes when they achieve it: ${vision}`,
+    blocker && `What held them back (reframe and crush this): ${blocker}`,
     identity && `Who they are becoming: ${identity}`,
-    blocker && `The belief/habit they are DONE with (reframe and crush this): ${blocker}`,
-    strength && `Their core strength (anchor to this): ${strength}`,
-    selfMessage && `What they need to hear (honor this tone): ${selfMessage}`,
+    strength && `Their core strength: ${strength}`,
     mood && `How they feel today: ${mood}`,
   ]
     .filter(Boolean)
@@ -373,9 +373,9 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     };
 
     const audioFiles = [];
-    // 5 psych questions: goal, identity, blocker, strength, weekGoal
-    const questionKeys = ['goal', 'identity', 'blocker', 'strength', 'weekGoal'];
-    const uploadKeys = ['q1', 'q2', 'q3', 'q4', 'q5'];
+    // v3 funnel: blocker (q1), vision (q2), goal90 (q3)
+    const questionKeys = ['blocker', 'vision', 'goal90'];
+    const uploadKeys = ['q1', 'q2', 'q3'];
     const transcriptions = [];
 
     for (let i = 0; i < uploadKeys.length; i++) {

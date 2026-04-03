@@ -107,14 +107,13 @@ const WHISPER_LANGUAGE = {
 };
 
 async function generateAffirmation(context, language) {
-  const { goal, goal90, mood, identity, blocker, vision, strength, gratitude, selfMessage, weeklyGoal, weekFocus, intro, bigDream, weekFocusAudio } = context;
+  const { goal, goal90, mood, intro, weekGoal, whyItMatters, weeklyGoal, weekFocus, identity, blocker, vision, strength } = context;
 
   const contextBlock = [
-    (weeklyGoal || weekFocus || weekFocusAudio) && `⭐ THIS WEEK'S FOCUS (most important - build the affirmation around this): ${weeklyGoal || weekFocus || weekFocusAudio}`,
-    (bigDream || vision || goal90 || goal) && `Long-term dream: ${bigDream || vision || goal90 || goal}`,
-    intro && `Who they are (extract their name from this): ${intro}`,
-    identity && `Who they are becoming: ${identity}`,
-    mood && `How they feel today: ${mood}`,
+    (weekGoal || weeklyGoal || weekFocus) && `⭐ THIS WEEK'S GOAL (most important): ${weekGoal || weeklyGoal || weekFocus}`,
+    whyItMatters && `Why it matters to them (emotional fuel): ${whyItMatters}`,
+    intro && `Who they are (extract name from this): ${intro}`,
+    (vision || goal || goal90) && `Long-term: ${vision || goal || goal90}`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -128,35 +127,54 @@ async function generateAffirmation(context, language) {
       {
         role: "system",
         content:
-          `You are a high-intensity personal coach delivering a daily spoken affirmation. You speak DIRECTLY to the person — second person. Like a great coach in the locker room before the game.
+          `You are a high-energy personal coach writing a 20-25 second spoken affirmation for the ALZO app. The affirmation plays in the user's own cloned voice every morning.
 
-THE FORMULA (follow exactly):
-1. Say their name if you can extract it from their intro
-2. One sentence that defines who they are — specific, based on what they said
-3. One sentence connecting this week to their big dream — make it feel inevitable
-4. One action for TODAY — concrete, urgent
-5. A 3-5 word closing punch
+YOUR JOB: Transform their answers into pure motivational fuel. Do NOT repeat what they said. TRANSFORM it.
 
-Example: "Nacho. You build things from zero. This week, launching ALZO is not a goal — it is inevitable. Today you make one move. Let's go."
+FORMULA (follow exactly, in order):
+1. [Name] + short identity statement (who they are, 5-7 words, from their intro)
+2. This week's goal stated as INEVITABLE FACT — not "you want", but "you will" or "this is happening"
+3. Why it matters — connect to the emotional reason they gave (1 sentence, powerful)
+4. One action for TODAY — specific, doable
+5. 3-5 word HIGH-ENERGY closer
 
-RULES:
-- MAX 40 words total
-- SECOND PERSON only: "You are", "You have", "You can" — NEVER "I am"
-- High energy, short sentences, zero filler words
-- NEVER: "universe", "manifest", "journey", "abundance", "vibration"
-- Fix brand names: "also app" = "ALZO"
+EXAMPLE OUTPUT:
+"Nacho. You build things that don't exist yet.
+This week, ALZO reaches its first users — that's not a goal, that's a fact.
+Because you know that one app can change how people see themselves.
+Today: one call, one post, one move.
+Let's go."
+
+TONE RULES based on mood:
+- "on_track": celebratory, momentum, "you're doing it"
+- "need_push": aggressive, urgent, no excuses, "get up"
+- "pivoting": resilient, adaptive, "the best pivot and win"
+- default: high energy, confident
+
+HARD RULES:
+- MAX 50 words. Non-negotiable.
+- ONLY second person: "You", "Your" — NEVER "I am"
+- Short punchy sentences. No filler.
+- Extract name from intro if mentioned
+- Fix brand names: "also" = "ALZO"
+- NEVER: universe, manifest, journey, abundance, vibration
 
 CRITICAL LANGUAGE RULE: ${langInstruction} This is non-negotiable.`,
       },
       {
         role: "user",
-        content: `Person context:
+        content: `Generate the daily affirmation.
+
+Context:
 ${contextBlock}
 
-Write the affirmation now. Follow the formula. Output only the spoken words. Language: ${langInstruction}`,
+Mood today: ${mood || "default"}
+
+Output only the affirmation text. No quotes, no labels, no explanations.
+Language: ${langInstruction}`,
       },
     ],
-    temperature: 0.8,
+    temperature: 0.85,
     max_tokens: 500,
   });
 
@@ -365,8 +383,8 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     };
 
     const audioFiles = [];
-    // v3 final: intro (q1=who you are), bigDream (q2=long term), weekFocusAudio (q3=this week)
-    const questionKeys = ['intro', 'bigDream', 'weekFocusAudio'];
+    // v3 FINAL: intro (q1=who you are), weekGoal (q2=this week), whyItMatters (q3=why)
+    const questionKeys = ['intro', 'weekGoal', 'whyItMatters'];
     const uploadKeys = ['q1', 'q2', 'q3'];
     const transcriptions = [];
 

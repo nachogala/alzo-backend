@@ -6,13 +6,38 @@ const fs = require("fs");
 const OpenAI = require("openai");
 
 const crypto = require("crypto");
+const Database = require("better-sqlite3");
 
 const app = express();
 const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
 
-// ── In-memory user store ────────────────────────────────────────────
-const users = new Map(); // email → { userId, email, passwordHash, token, streak, language, plan }
-const tokens = new Map(); // token → email
+// ── SQLite persistence ──────────────────────────────────────────────
+const db = new Database(process.env.DB_PATH || "./alzo.db");
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    name TEXT,
+    passwordHash TEXT NOT NULL,
+    token TEXT,
+    streak INTEGER DEFAULT 0,
+    language TEXT DEFAULT 'en-US',
+    plan TEXT DEFAULT 'Free Trial',
+    createdAt TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+// Prepared statements
+const stmts = {
+  getByEmail: db.prepare("SELECT * FROM users WHERE email = ?"),
+  getByToken: db.prepare("SELECT * FROM users WHERE token = ?"),
+  insert: db.prepare("INSERT INTO users (id, email, name, passwordHash, token, streak, language, plan) VALUES (?, ?, ?, ?, ?, 0, 'en-US', 'Free Trial')"),
+  updateToken: db.prepare("UPDATE users SET token = ? WHERE email = ?"),
+  updatePlan: db.prepare("UPDATE users SET plan = ? WHERE email = ?"),
+  deleteUser: db.prepare("DELETE FROM users WHERE email = ?"),
+};
 
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
@@ -26,9 +51,7 @@ function getUserByToken(req) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith("Bearer ")) return null;
   const token = auth.slice(7);
-  const email = tokens.get(token);
-  if (!email) return null;
-  return users.get(email) || null;
+  return stmts.getByToken.get(token) || null;
 }
 
 // Ensure directories exist
@@ -431,16 +454,16 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
 
 // ── Auth endpoints ──────────────────────────────────────────────────
 app.post("/api/auth/signup", (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, name } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
   if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
-  if (users.has(email.toLowerCase())) return res.status(409).json({ error: "Account already exists" });
+
+  const existing = stmts.getByEmail.get(email.toLowerCase());
+  if (existing) return res.status(409).json({ error: "Account already exists" });
 
   const userId = crypto.randomBytes(16).toString("hex");
   const token = generateToken();
-  const user = { userId, email: email.toLowerCase(), passwordHash: hashPassword(password), token, streak: 0, language: "en-US", plan: "Free Trial" };
-  users.set(email.toLowerCase(), user);
-  tokens.set(token, email.toLowerCase());
+  stmts.insert.run(userId, email.toLowerCase(), name || null, hashPassword(password), token);
 
   res.json({ token, userId });
 });
@@ -449,38 +472,45 @@ app.post("/api/auth/login", (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
 
-  const user = users.get(email.toLowerCase());
+  const user = stmts.getByEmail.get(email.toLowerCase());
   if (!user || user.passwordHash !== hashPassword(password)) {
     return res.status(401).json({ error: "Invalid email or password" });
   }
 
   const token = generateToken();
-  if (user.token) tokens.delete(user.token);
-  user.token = token;
-  tokens.set(token, email.toLowerCase());
+  stmts.updateToken.run(token, email.toLowerCase());
 
-  res.json({ token, userId: user.userId });
+  res.json({ token, userId: user.id });
 });
 
 app.get("/api/user/profile", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  res.json({ email: user.email, streak: user.streak, language: user.language, plan: user.plan });
+  res.json({ email: user.email, name: user.name, streak: user.streak, language: user.language, plan: user.plan });
 });
 
 app.delete("/api/user", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  tokens.delete(user.token);
-  users.delete(user.email);
+  stmts.deleteUser.run(user.email);
   res.json({ success: true });
 });
 
 app.post("/api/subscription/cancel", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  user.plan = "Cancelled";
+  stmts.updatePlan.run("Cancelled", user.email);
   res.json({ success: true });
+});
+
+// ── Demo audio endpoint ─────────────────────────────────────────────
+app.get("/audio/demo.mp3", (req, res) => {
+  const demoPath = path.join(__dirname, "public", "audio", "demo.mp3");
+  if (fs.existsSync(demoPath)) {
+    res.sendFile(demoPath);
+  } else {
+    res.status(404).json({ error: "Demo not available" });
+  }
 });
 
 // ── Health check ─────────────────────────────────────────────────────

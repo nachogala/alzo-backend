@@ -182,7 +182,7 @@ function withTimeout(promise, ms) {
   ]);
 }
 
-async function cloneVoiceAndSpeak(text, voiceFilePath, gender) {
+async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language) {
   if (!ELEVENLABS_API_KEY) return null;
 
   try {
@@ -190,12 +190,16 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender) {
     const formData = new FormData();
     formData.append("name", `alzo_${Date.now()}`);
     formData.append("description", "ALZO user voice clone for affirmations");
-    const fileBuffer = fs.readFileSync(voiceFilePath);
-    formData.append(
-      "files",
-      new Blob([fileBuffer], { type: "audio/webm" }),
-      "voice_sample.webm"
-    );
+    // Send all available voice files for better clone quality
+    if (Array.isArray(voiceFilePath)) {
+      voiceFilePath.forEach((fp, i) => {
+        const buf = fs.readFileSync(fp);
+        formData.append("files", new Blob([buf], { type: "audio/m4a" }), `sample_${i}.m4a`);
+      });
+    } else {
+      const fileBuffer = fs.readFileSync(voiceFilePath);
+      formData.append("files", new Blob([fileBuffer], { type: "audio/m4a" }), "voice_sample.m4a");
+    }
 
     const addVoiceRes = await withTimeout(fetch(`${ELEVENLABS_BASE}/voices/add`, {
       method: "POST",
@@ -205,16 +209,16 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender) {
 
     if (!addVoiceRes || !addVoiceRes.ok) {
       console.error("Voice clone failed:", await addVoiceRes.text());
-      return await textToSpeechFallback(text, gender);
+      return await textToSpeechFallback(text, gender, language);
     }
 
     const { voice_id } = await addVoiceRes.json();
 
     // Step 2: Generate speech with the cloned voice (30s timeout)
-    const audioUrl = await withTimeout(generateSpeech(text, voice_id), 30000);
+    const audioUrl = await withTimeout(generateSpeech(text, voice_id, language), 30000);
     if (!audioUrl) {
       fetch(`${ELEVENLABS_BASE}/voices/${voice_id}`, { method: 'DELETE', headers: { 'xi-api-key': ELEVENLABS_API_KEY } }).catch(() => {});
-      return await textToSpeechFallback(text, gender);
+      return await textToSpeechFallback(text, gender, language);
     }
 
     // Step 3: Clean up — delete the cloned voice
@@ -226,7 +230,7 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender) {
     return audioUrl;
   } catch (err) {
     console.error("ElevenLabs clone error:", err.message);
-    return await textToSpeechFallback(text, gender);
+    return await textToSpeechFallback(text, gender, language);
   }
 }
 
@@ -405,13 +409,22 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
       console.log('Using question audio for cloning (no dedicated sample)');
     }
 
-    let voiceReady = !!(combinedVoicePath && ELEVENLABS_API_KEY);
+    let voiceReady = !!((audioFiles.length > 0 || combinedVoicePath) && ELEVENLABS_API_KEY);
 
     const sessionId = Date.now().toString();
-    if (combinedVoicePath) {
-      const destPath = path.join(__dirname, "uploads", `voice_${sessionId}.webm`);
-      fs.copyFileSync(combinedVoicePath, destPath);
-      audioFiles.forEach((f) => fs.unlink(f, () => {}));
+    // Save ALL audio files for richer voice cloning
+    const allVoiceFiles = [...audioFiles];
+    if (combinedVoicePath && !allVoiceFiles.includes(combinedVoicePath)) {
+      allVoiceFiles.push(combinedVoicePath);
+    }
+    if (allVoiceFiles.length > 0) {
+      // Save paths list to a JSON file so generate-affirmation can find all samples
+      const voiceManifest = path.join(__dirname, "uploads", `voice_manifest_${sessionId}.json`);
+      fs.writeFileSync(voiceManifest, JSON.stringify(allVoiceFiles));
+      // Also copy primary for backwards compat
+      const destPath = path.join(__dirname, "uploads", `voice_${sessionId}.m4a`);
+      fs.copyFileSync(allVoiceFiles[allVoiceFiles.length - 1], destPath);
+      allVoiceFiles.forEach((f) => { if (f !== destPath) fs.unlink(f, () => {}); });
       res.json({ voiceReady, context, sessionId, detectedGender, language });
     } else {
       res.json({ voiceReady, context, sessionId, detectedGender, language });
@@ -434,16 +447,24 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     // 1. Generate affirmation text
     const affirmationText = await generateAffirmation(context, language);
 
-    // 2. Generate audio
+    // 2. Generate audio — use all voice samples if available
     let audioUrl = null;
-    const voicePath = path.join(
-      __dirname,
-      "uploads",
-      `voice_${sessionId}.webm`
-    );
+    const manifestPath = path.join(__dirname, "uploads", `voice_manifest_${sessionId}.json`);
+    const voicePathM4a = path.join(__dirname, "uploads", `voice_${sessionId}.m4a`);
+    const voicePathWebm = path.join(__dirname, "uploads", `voice_${sessionId}.webm`);
+    const voicePath = fs.existsSync(voicePathM4a) ? voicePathM4a : (fs.existsSync(voicePathWebm) ? voicePathWebm : null);
 
-    if (sessionId && fs.existsSync(voicePath)) {
-      audioUrl = await cloneVoiceAndSpeak(affirmationText, voicePath, gender);
+    if (sessionId && voicePath) {
+      // Try to use manifest (all samples) for better clone
+      let voiceArg = voicePath;
+      if (fs.existsSync(manifestPath)) {
+        try {
+          const files = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).filter(f => fs.existsSync(f));
+          if (files.length > 1) voiceArg = files;
+        } catch {}
+        fs.unlink(manifestPath, () => {});
+      }
+      audioUrl = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language);
       fs.unlink(voicePath, () => {});
     } else {
       audioUrl = await textToSpeechFallback(affirmationText, gender, language);

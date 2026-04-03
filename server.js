@@ -365,11 +365,9 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     const language = req.body.language || 'en-US';
 
     let context = {
-      mood: "",
+      blocker: "",
+      vision: "",
       goal: "",
-      identity: "",
-      gratitude: "",
-      selfMessage: "",
     };
 
     const audioFiles = [];

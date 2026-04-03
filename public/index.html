@@ -3,86 +3,170 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>InnerVoice — Affirmations that sound like you</title>
+  <title>ALZO — Rise in your own voice</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+
+  <!-- Progress bar -->
+  <div class="progress-bar">
+    <div class="progress-fill" id="progressFill"></div>
+  </div>
+
   <div class="container">
 
-    <!-- ═══════ SCREEN 1: LANDING ═══════ -->
-    <div id="landing" class="screen landing active">
+    <!-- ═══════ SCREEN 1: WELCOME ═══════ -->
+    <div id="welcome" class="screen landing active">
       <div>
-        <div class="logo">🎙️</div>
-        <h1>Your voice. Your words.<br /><span>Every morning.</span></h1>
+        <div class="logo">
+          <img src="/logo.png" alt="ALZO" style="width:88px;height:88px;object-fit:contain;" />
+        </div>
+        <h1>Rise in your own voice.</h1>
       </div>
-      <p class="sub">The only affirmation app that sounds exactly like you.</p>
-      <button class="btn btn-primary" onclick="showScreen('goal')">
-        Try it free — hear your voice in 60 seconds
+      <p class="sub">Every morning at 7am, hear yourself say exactly what you need.</p>
+      <p class="hint" style="margin-top:1.5rem;margin-bottom:0.5rem;font-size:0.85rem;opacity:0.7;">Choose your language</p>
+      <div style="display:flex;gap:0.6rem;width:100%;flex-wrap:wrap;justify-content:center;">
+        <button class="btn btn-secondary lang-btn" id="lang-en" onclick="selectLanguage('en-US')" style="flex:1;min-width:120px">🇺🇸 English</button>
+        <button class="btn btn-secondary lang-btn" id="lang-es" onclick="selectLanguage('es-AR')" style="flex:1;min-width:120px">🇦🇷 Español</button>
+        <button class="btn btn-secondary lang-btn" id="lang-pt" onclick="selectLanguage('pt-BR')" style="flex:1;min-width:120px">🇧🇷 Português</button>
+      </div>
+      <button class="btn btn-primary" id="beginBtn" onclick="startOnboarding()" style="margin-top:1.5rem;width:100%;opacity:0.4;pointer-events:none">
+        Begin your first ALZO →
       </button>
     </div>
 
-    <!-- ═══════ SCREEN 2: GOAL INPUT ═══════ -->
-    <div id="goal" class="screen">
-      <span class="step-label">Step 1 of 2</span>
-      <h2>What do you want to achieve?</h2>
-      <p class="hint">Be specific. The more detail you give, the more powerful your affirmation will be.</p>
-      <textarea
-        id="goalInput"
-        placeholder="I want to build a successful app and achieve financial freedom by end of 2026"
-        maxlength="1000"
-      ></textarea>
-      <div class="mt-auto mt-2">
-        <button class="btn btn-primary" style="width:100%" onclick="goToVoice()">
-          Next — Record your voice
-        </button>
-      </div>
-    </div>
-
-    <!-- ═══════ SCREEN 3: VOICE RECORDING ═══════ -->
-    <div id="voice" class="screen">
-      <span class="step-label">Step 2 of 2</span>
-      <h2>Now let us hear your voice</h2>
-      <p class="hint">Read the text below aloud. We'll use your voice to personalize your affirmation.</p>
-
-      <div class="sample-text">
-        "I am someone who takes action every single day. I trust my ability to figure things out, even when the path is unclear. I speak with confidence. I move with purpose. I do not wait for permission to become the person I am meant to be. Today is not just another day — it is my opportunity to prove what I'm made of."
-      </div>
-
+    <!-- ═══════ SCREEN 2: Q1 — Mood ═══════ -->
+    <div id="q1" class="screen question-screen">
+      <span class="step-label">1 of 5</span>
+      <h2 id="label-q1">How are you feeling right now?</h2>
+      <p class="hint" id="hint-q1">Describe it in 2-3 sentences.</p>
       <div class="recorder-area">
-        <div class="record-timer" id="timer">0:00</div>
-        <button class="record-btn" id="recordBtn" onclick="toggleRecording()">
-          <svg id="micIcon" viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
-          <svg id="stopIcon" style="display:none" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        <canvas class="waveform" id="waveform-q1" width="300" height="80"></canvas>
+        <div class="record-timer" id="timer-q1">0:00</div>
+        <button class="record-btn" id="recordBtn-q1" onclick="toggleRecording('q1')" ontouchstart="">
+          <svg class="mic-icon" viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+          <svg class="stop-icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
         </button>
-        <div class="record-status" id="recordStatus">Tap to start recording</div>
+        <div class="record-status" id="status-q1">Tap to record your answer</div>
       </div>
-
       <div class="mt-auto mt-2">
-        <button class="btn btn-primary" id="generateBtn" style="width:100%" onclick="generate()" disabled>
-          Generate my affirmation
-        </button>
-        <button class="btn btn-secondary mt-1" style="width:100%" onclick="skipVoice()">
-          Skip — just generate the text
-        </button>
+        <button class="btn btn-primary" style="width:100%" onclick="nextQuestion('q1','q2')">Next →</button>
       </div>
     </div>
 
-    <!-- ═══════ SCREEN 4: PROCESSING ═══════ -->
-    <div id="processing" class="screen processing">
-      <div class="spinner"></div>
+    <!-- ═══════ SCREEN 3: Q2 — Goal ═══════ -->
+    <div id="q2" class="screen question-screen">
+      <span class="step-label">2 of 5</span>
+      <h2 id="label-q2">What is the most important thing you want to achieve in the next 90 days?</h2>
+      <p class="hint" id="hint-q2">Be as specific as you can.</p>
+      <div class="recorder-area">
+        <canvas class="waveform" id="waveform-q2" width="300" height="80"></canvas>
+        <div class="record-timer" id="timer-q2">0:00</div>
+        <button class="record-btn" id="recordBtn-q2" onclick="toggleRecording('q2')" ontouchstart="">
+          <svg class="mic-icon" viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+          <svg class="stop-icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <div class="record-status" id="status-q2">Tap to record your answer</div>
+      </div>
+      <div class="mt-auto mt-2">
+        <button class="btn btn-primary" style="width:100%" onclick="nextQuestion('q2','q3')">Next →</button>
+      </div>
+    </div>
+
+    <!-- ═══════ SCREEN 4: Q3 — Identity ═══════ -->
+    <div id="q3" class="screen question-screen">
+      <span class="step-label">3 of 5</span>
+      <h2 id="label-q3">Describe yourself with 3 words. Why those three?</h2>
+      <p class="hint" id="hint-q3">There are no wrong answers.</p>
+      <div class="recorder-area">
+        <canvas class="waveform" id="waveform-q3" width="300" height="80"></canvas>
+        <div class="record-timer" id="timer-q3">0:00</div>
+        <button class="record-btn" id="recordBtn-q3" onclick="toggleRecording('q3')" ontouchstart="">
+          <svg class="mic-icon" viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+          <svg class="stop-icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <div class="record-status" id="status-q3">Tap to record your answer</div>
+      </div>
+      <div class="mt-auto mt-2">
+        <button class="btn btn-primary" style="width:100%" onclick="nextQuestion('q3','q4')">Next →</button>
+      </div>
+    </div>
+
+    <!-- ═══════ SCREEN 5: Q4 — Gratitude ═══════ -->
+    <div id="q4" class="screen question-screen">
+      <span class="step-label">4 of 5</span>
+      <h2 id="label-q4">What are you proud of this week, even something small?</h2>
+      <p class="hint" id="hint-q4">Celebrate yourself.</p>
+      <div class="recorder-area">
+        <canvas class="waveform" id="waveform-q4" width="300" height="80"></canvas>
+        <div class="record-timer" id="timer-q4">0:00</div>
+        <button class="record-btn" id="recordBtn-q4" onclick="toggleRecording('q4')" ontouchstart="">
+          <svg class="mic-icon" viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+          <svg class="stop-icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <div class="record-status" id="status-q4">Tap to record your answer</div>
+      </div>
+      <div class="mt-auto mt-2">
+        <button class="btn btn-primary" style="width:100%" onclick="nextQuestion('q4','q5')">Next →</button>
+      </div>
+    </div>
+
+    <!-- ═══════ SCREEN 6: Q5 — The Magic Question ═══════ -->
+    <div id="q5" class="screen question-screen">
+      <span class="step-label">5 of 5</span>
+      <h2 id="label-q5">Say something to yourself.</h2>
+      <p class="hint" id="hint-q5">Whatever you need to hear today. This becomes the seed for your first affirmation.</p>
+      <div class="recorder-area">
+        <canvas class="waveform" id="waveform-q5" width="300" height="80"></canvas>
+        <div class="record-timer" id="timer-q5">0:00</div>
+        <button class="record-btn" id="recordBtn-q5" onclick="toggleRecording('q5')" ontouchstart="">
+          <svg class="mic-icon" viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+          <svg class="stop-icon" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <div class="record-status" id="status-q5">Tap to record your answer</div>
+      </div>
+      <div class="mt-auto mt-2">
+        <button class="btn btn-primary" id="submitBtn" style="width:100%" onclick="submitOnboarding()">Create my ALZO →</button>
+      </div>
+    </div>
+
+    <!-- ═══════ SCREEN 7: PUSH NOTIFICATIONS ═══════ -->
+    <div id="notifications" class="screen landing">
       <div>
-        <h2>Creating your affirmation...</h2>
-        <p class="mt-1" id="processingMsg">Analyzing your goals and crafting something powerful.</p>
+        <div style="font-size:3rem;margin-bottom:1rem;">🔔</div>
+        <h1 id="notif-title" style="font-size:1.8rem;margin-bottom:0.75rem;">Wake up to your own voice.</h1>
+        <p class="sub" id="notif-sub">ALZO sends your affirmation every morning at 7am — in your voice, with your words. Allow notifications to make it real.</p>
+      </div>
+      <div style="width:100%;margin-top:2rem;display:flex;flex-direction:column;gap:0.75rem;">
+        <button class="btn btn-primary" style="width:100%" id="notifAllowBtn" onclick="requestNotifications()">
+          Allow notifications
+        </button>
+        <button class="btn btn-secondary" style="width:100%;opacity:0.6;" onclick="skipNotifications()">
+          Maybe later
+        </button>
       </div>
     </div>
 
-    <!-- ═══════ SCREEN 5: RESULT ═══════ -->
-    <div id="result" class="screen result">
-      <span class="step-label">Your affirmation</span>
-      <h2>Here's what your morning sounds like</h2>
+    <!-- ═══════ SCREEN 8: PROCESSING ═══════ -->
+    <div id="processing" class="screen processing">
+      <div class="processing-wave">
+        <canvas id="processingCanvas" width="300" height="100"></canvas>
+      </div>
+      <div>
+        <h2 id="processingTitle">Learning your voice...</h2>
+        <p class="mt-1" id="processingMsg">Crafting your first ALZO...</p>
+      </div>
+    </div>
 
-      <div id="audioSection" style="display:none">
-        <audio id="audioPlayer" controls></audio>
+    <!-- ═══════ SCREEN 9: THE WOW MOMENT ═══════ -->
+    <div id="result" class="screen result">
+      <div class="wordmark wordmark-sm">ALZO</div>
+
+      <div id="audioSection" style="display:none;width:100%;">
+        <audio id="audioPlayer" controls autoplay style="width:100%;margin-bottom:1.5rem;"></audio>
       </div>
 
       <div class="affirmation-card">
@@ -90,133 +174,418 @@
       </div>
 
       <div class="cta-final">
-        <p>Your daily affirmation is ready.<br />Get the app for daily delivery.</p>
-        <button class="btn btn-primary" onclick="showScreen('landing')">Start over</button>
+        <button class="btn btn-primary" style="width:100%" onclick="alert('Coming soon!')">
+          Get ALZO — hear this every morning
+        </button>
+        <button class="btn btn-secondary mt-1" style="width:100%" onclick="shareAlzo()">
+          Share the feeling →
+        </button>
       </div>
     </div>
 
   </div>
 
 <script>
+// ── State ─────────────────────────────────────────────
+const recordings = {};
+const recorders = {};
+let isSubmitting = false;
+let selectedLanguage = null;
+
+// Question labels per language
+const QUESTIONS = {
+  'en-US': [
+    { label: 'How are you feeling right now?',                                 hint: 'Describe it in 2-3 sentences.' },
+    { label: 'What is the most important thing you want to achieve in the next 90 days?', hint: 'Be as specific as you can.' },
+    { label: 'Describe yourself with 3 words. Why those three?',              hint: 'There are no wrong answers.' },
+    { label: 'What are you proud of this week, even something small?',        hint: 'Celebrate yourself.' },
+    { label: 'Say something to yourself.',                                    hint: 'Whatever you need to hear today.' },
+  ],
+  'es-AR': [
+    { label: '¿Cómo te sentís ahora mismo?',                                  hint: 'Describilo en 2-3 oraciones.' },
+    { label: '¿Qué es lo más importante que querés lograr en los próximos 90 días?', hint: 'Sé lo más específico que puedas.' },
+    { label: 'Describite con 3 palabras. ¿Por qué esas tres?',               hint: 'No hay respuestas incorrectas.' },
+    { label: '¿De qué estás orgulloso esta semana, aunque sea algo pequeño?', hint: 'Celebrá lo que lograste.' },
+    { label: 'Decite algo a vos mismo.',                                      hint: 'Lo que necesitás escuchar hoy.' },
+  ],
+  'pt-BR': [
+    { label: 'Como você está se sentindo agora?',                              hint: 'Descreva em 2-3 frases.' },
+    { label: 'Qual é a coisa mais importante que você quer conquistar nos próximos 90 dias?', hint: 'Seja o mais específico possível.' },
+    { label: 'Descreva-se com 3 palavras. Por que essas três?',               hint: 'Não há respostas erradas.' },
+    { label: 'Do que você se orgulha esta semana, mesmo que pequeno?',        hint: 'Celebre você mesmo.' },
+    { label: 'Diga algo para si mesmo.',                                      hint: 'O que você precisa ouvir hoje.' },
+  ],
+};
+
+const RECORD_STATUS = {
+  'en-US': { tap: 'Tap to record your answer', recording: 'Recording... tap to stop', saved: 'Recording saved ✓' },
+  'es-AR': { tap: 'Tocá para grabar tu respuesta', recording: 'Grabando... tocá para detener', saved: 'Grabación guardada ✓' },
+  'pt-BR': { tap: 'Toque para gravar sua resposta', recording: 'Gravando... toque para parar', saved: 'Gravação salva ✓' },
+};
+
+const NOTIF_COPY = {
+  'en-US': {
+    title: 'Wake up to your own voice.',
+    sub: 'ALZO sends your affirmation every morning at 7am — in your voice, with your words. Allow notifications to make it real.',
+    allow: 'Allow notifications',
+    skip: 'Maybe later',
+  },
+  'es-AR': {
+    title: 'Despertate con tu propia voz.',
+    sub: 'ALZO te manda tu afirmación cada mañana a las 7am — con tu voz, con tus palabras. Activá las notificaciones para hacerlo real.',
+    allow: 'Activar notificaciones',
+    skip: 'Quizás después',
+  },
+  'pt-BR': {
+    title: 'Acorde com sua própria voz.',
+    sub: 'ALZO envia sua afirmação toda manhã às 7h — com sua voz, com suas palavras. Ative as notificações para tornar isso real.',
+    allow: 'Ativar notificações',
+    skip: 'Talvez depois',
+  },
+};
+
+const questionKeys = ['q1','q2','q3','q4','q5'];
+
+// ── Language selection ────────────────────────────────
+function selectLanguage(lang) {
+  selectedLanguage = lang;
+  document.querySelectorAll('.lang-btn').forEach(b => {
+    b.style.opacity = '0.4';
+    b.style.border = '';
+  });
+  const id = lang === 'en-US' ? 'lang-en' : lang === 'es-AR' ? 'lang-es' : 'lang-pt';
+  document.getElementById(id).style.opacity = '1';
+  document.getElementById(id).style.border = '2px solid #7c3aed';
+  const btn = document.getElementById('beginBtn');
+  btn.style.opacity = '1';
+  btn.style.pointerEvents = 'auto';
+
+  // Update question labels
+  const qs = QUESTIONS[lang];
+  questionKeys.forEach((k, i) => {
+    document.getElementById('label-' + k).textContent = qs[i].label;
+    document.getElementById('hint-' + k).textContent  = qs[i].hint;
+    document.getElementById('status-' + k).textContent = RECORD_STATUS[lang].tap;
+  });
+
+  // Update begin button text
+  const beginLabels = { 'en-US': 'Begin your first ALZO →', 'es-AR': 'Comenzar mi primer ALZO →', 'pt-BR': 'Começar meu primeiro ALZO →' };
+  btn.textContent = beginLabels[lang];
+
+  // Update notification screen copy
+  const nc = NOTIF_COPY[lang] || NOTIF_COPY['en-US'];
+  document.getElementById('notif-title').textContent = nc.title;
+  document.getElementById('notif-sub').textContent = nc.sub;
+  document.getElementById('notifAllowBtn').textContent = nc.allow;
+}
+
+// ── Progress bar ──────────────────────────────────────
+function updateProgress(step) {
+  document.getElementById('progressFill').style.width = (step * 20) + '%';
+}
+
 // ── Screen navigation ────────────────────────────────
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
 }
 
-function goToVoice() {
-  const goal = document.getElementById('goalInput').value.trim();
-  if (!goal) {
-    document.getElementById('goalInput').focus();
+function startOnboarding() {
+  updateProgress(1);
+  showScreen('q1');
+}
+
+function nextQuestion(from, to) {
+  stopRecordingIfActive(from);
+  const idx = questionKeys.indexOf(to) + 1;
+  updateProgress(idx);
+  showScreen(to);
+}
+
+function startOver() {
+  isSubmitting = false;
+  Object.keys(recordings).forEach(k => delete recordings[k]);
+  questionKeys.forEach(k => {
+    const status = document.getElementById('status-' + k);
+    status.textContent = selectedLanguage ? RECORD_STATUS[selectedLanguage].tap : 'Tap to record your answer';
+    document.getElementById('timer-' + k).textContent = '0:00';
+    const btn = document.getElementById('recordBtn-' + k);
+    btn.classList.remove('recording', 'recorded');
+  });
+  const submitBtn = document.getElementById('submitBtn');
+  submitBtn.disabled = false;
+  submitBtn.style.opacity = '1';
+  updateProgress(0);
+  showScreen('welcome');
+}
+
+// ── Push notifications ────────────────────────────────
+async function requestNotifications() {
+  if (!('Notification' in window)) {
+    skipNotifications();
     return;
   }
-  showScreen('voice');
+  try {
+    const permission = await Notification.requestPermission();
+    console.log('Notification permission:', permission);
+  } catch(e) {
+    console.log('Notification error:', e);
+  }
+  // Either way, move to processing
+  showProcessing();
+}
+
+function skipNotifications() {
+  showProcessing();
+}
+
+// ── Waveform drawing ─────────────────────────────────
+function drawWaveform(canvasId, analyser) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const bufferLength = analyser.frequencyBinCount;
+  const dataArray = new Uint8Array(bufferLength);
+
+  function draw() {
+    const state = Object.values(recorders).find(r => r && r.analyser === analyser);
+    if (!state || !state.mediaRecorder || state.mediaRecorder.state !== 'recording') return;
+
+    state.animFrame = requestAnimationFrame(draw);
+    analyser.getByteTimeDomainData(dataArray);
+
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#7c3aed';
+    ctx.beginPath();
+
+    const sliceWidth = canvas.width / bufferLength;
+    let x = 0;
+    for (let i = 0; i < bufferLength; i++) {
+      const v = dataArray[i] / 128.0;
+      const y = (v * canvas.height) / 2;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      x += sliceWidth;
+    }
+    ctx.lineTo(canvas.width, canvas.height / 2);
+    ctx.stroke();
+  }
+  draw();
 }
 
 // ── Voice recording ──────────────────────────────────
-let mediaRecorder = null;
-let audioChunks = [];
-let recordingBlob = null;
-let timerInterval = null;
-let seconds = 0;
-
-function updateTimer() {
-  seconds++;
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  document.getElementById('timer').textContent = `${m}:${s.toString().padStart(2, '0')}`;
+function stopRecordingIfActive(qKey) {
+  const state = recorders[qKey];
+  if (state && state.mediaRecorder && state.mediaRecorder.state === 'recording') {
+    state.mediaRecorder.stop();
+    clearInterval(state.timer);
+    if (state.animFrame) cancelAnimationFrame(state.animFrame);
+    const btn = document.getElementById('recordBtn-' + qKey);
+    btn.classList.remove('recording');
+    btn.classList.add('recorded');
+    const lang = selectedLanguage || 'en-US';
+    document.getElementById('status-' + qKey).textContent = RECORD_STATUS[lang].saved;
+    if (state.stream) state.stream.getTracks().forEach(t => t.stop());
+  }
 }
 
-async function toggleRecording() {
-  const btn = document.getElementById('recordBtn');
-  const status = document.getElementById('recordStatus');
-  const micIcon = document.getElementById('micIcon');
-  const stopIcon = document.getElementById('stopIcon');
+async function toggleRecording(qKey) {
+  const btn = document.getElementById('recordBtn-' + qKey);
+  const status = document.getElementById('status-' + qKey);
+  const timerEl = document.getElementById('timer-' + qKey);
+  const lang = selectedLanguage || 'en-US';
 
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    // Stop
-    mediaRecorder.stop();
-    btn.classList.remove('recording');
-    micIcon.style.display = '';
-    stopIcon.style.display = 'none';
-    status.textContent = 'Recording saved. Ready to generate!';
-    clearInterval(timerInterval);
+  if (recorders[qKey] && recorders[qKey].mediaRecorder && recorders[qKey].mediaRecorder.state === 'recording') {
+    stopRecordingIfActive(qKey);
     return;
   }
 
-  // Start
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(stream);
-    audioChunks = [];
+    const audioCtx = new AudioContext();
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
 
-    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    const mediaRecorder = new MediaRecorder(stream);
+    const chunks = [];
+
+    mediaRecorder.ondataavailable = e => chunks.push(e.data);
     mediaRecorder.onstop = () => {
-      recordingBlob = new Blob(audioChunks, { type: 'audio/webm' });
-      document.getElementById('generateBtn').disabled = false;
-      stream.getTracks().forEach(t => t.stop());
+      recordings[qKey] = new Blob(chunks, { type: 'audio/webm' });
     };
 
+    let seconds = 0;
+    const timer = setInterval(() => {
+      seconds++;
+      const m = Math.floor(seconds / 60);
+      const s = seconds % 60;
+      timerEl.textContent = `${m}:${s.toString().padStart(2, '0')}`;
+    }, 1000);
+
+    recorders[qKey] = { mediaRecorder, chunks, timer, seconds, stream, analyser, animFrame: null };
     mediaRecorder.start();
+
     btn.classList.add('recording');
-    micIcon.style.display = 'none';
-    stopIcon.style.display = '';
-    status.textContent = 'Recording... tap to stop';
-    seconds = 0;
-    document.getElementById('timer').textContent = '0:00';
-    timerInterval = setInterval(updateTimer, 1000);
+    btn.classList.remove('recorded');
+    status.textContent = RECORD_STATUS[lang].recording;
+    timerEl.textContent = '0:00';
+
+    drawWaveform('waveform-' + qKey, analyser);
   } catch (err) {
-    status.textContent = 'Microphone access denied. You can skip this step.';
+    status.textContent = 'Microphone access denied.';
     console.error(err);
   }
 }
 
-// ── Skip voice ───────────────────────────────────────
-function skipVoice() {
-  recordingBlob = null;
-  generate();
+// ── Submit onboarding → show notifications first ──────
+async function submitOnboarding() {
+  if (isSubmitting) return;
+
+  const submitBtn = document.getElementById('submitBtn');
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.style.opacity = '0.5'; }
+
+  stopRecordingIfActive('q5');
+  await new Promise(r => setTimeout(r, 200));
+
+  // Show notifications screen before processing
+  showScreen('notifications');
 }
 
-// ── Generate affirmation ─────────────────────────────
-async function generate() {
-  const goal = document.getElementById('goalInput').value.trim();
-  if (!goal) return;
-
+// ── After notifications decision, start processing ────
+async function showProcessing() {
+  isSubmitting = true;
   showScreen('processing');
+  updateProgress(0);
+  startProcessingAnimation();
 
   try {
     const formData = new FormData();
-    formData.append('goal', goal);
-    if (recordingBlob) {
-      formData.append('voiceFile', recordingBlob, 'voice.webm');
-    }
 
-    const res = await fetch('/api/generate-affirmation', {
-      method: 'POST',
-      body: formData,
+    questionKeys.forEach(k => {
+      if (recordings[k]) formData.append(k, recordings[k], k + '.webm');
     });
 
-    if (!res.ok) throw new Error('Server error');
+    formData.append('language', selectedLanguage || 'en-US');
 
-    const data = await res.json();
+    const processingTitle = document.getElementById('processingTitle');
+    const processingMsg   = document.getElementById('processingMsg');
 
-    // Show result
-    document.getElementById('affirmationText').textContent = data.affirmationText;
+    const langMessages = {
+      'en-US': { title: 'Learning your voice...', msg: 'Crafting your first ALZO...', title2: 'Almost there...', msg2: 'This is going to be powerful.' },
+      'es-AR': { title: 'Aprendiendo tu voz...', msg: 'Creando tu primer ALZO...', title2: 'Casi listo...', msg2: 'Va a ser poderoso.' },
+      'pt-BR': { title: 'Aprendendo sua voz...', msg: 'Criando seu primeiro ALZO...', title2: 'Quase lá...', msg2: 'Vai ser poderoso.' },
+    };
+    const msgs = langMessages[selectedLanguage || 'en-US'];
+
+    processingTitle.textContent = msgs.title;
+    processingMsg.textContent   = msgs.msg;
+
+    const onboardRes = await fetch('/api/onboarding', { method: 'POST', body: formData });
+    if (!onboardRes.ok) throw new Error('Onboarding failed');
+    const onboardData = await onboardRes.json();
+
+    processingTitle.textContent = msgs.title2;
+    processingMsg.textContent   = msgs.msg2;
+
+    const genRes = await fetch('/api/generate-affirmation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        context: onboardData.context,
+        sessionId: onboardData.sessionId,
+        language: selectedLanguage || 'en-US',
+        detectedGender: onboardData.detectedGender,
+      }),
+    });
+    if (!genRes.ok) throw new Error('Generation failed');
+    const genData = await genRes.json();
+
+    document.getElementById('affirmationText').textContent = genData.affirmationText;
 
     const audioSection = document.getElementById('audioSection');
-    if (data.audioUrl) {
-      document.getElementById('audioPlayer').src = data.audioUrl;
+    if (genData.audioUrl) {
+      document.getElementById('audioPlayer').src = genData.audioUrl;
       audioSection.style.display = '';
     } else {
       audioSection.style.display = 'none';
     }
 
+    stopProcessingAnimation();
     showScreen('result');
   } catch (err) {
     console.error(err);
-    document.getElementById('processingMsg').textContent =
-      'Something went wrong. Please try again.';
-    setTimeout(() => showScreen('voice'), 2000);
+    document.getElementById('processingTitle').textContent = 'Something went wrong.';
+    document.getElementById('processingMsg').textContent   = 'Please try again.';
+    stopProcessingAnimation();
+    setTimeout(() => { isSubmitting = false; startOver(); }, 2500);
+    return;
+  }
+  isSubmitting = false;
+}
+
+// ── Processing animation ─────────────────────────────
+let processingAnimFrame = null;
+
+function startProcessingAnimation() {
+  const canvas = document.getElementById('processingCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  let phase = 0;
+
+  function draw() {
+    processingAnimFrame = requestAnimationFrame(draw);
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.strokeStyle = '#7c3aed';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let x = 0; x < canvas.width; x++) {
+      const y = canvas.height / 2 + Math.sin((x * 0.02) + phase) * 20 + Math.sin((x * 0.035) + phase * 1.5) * 10;
+      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(167, 139, 250, 0.4)';
+    ctx.beginPath();
+    for (let x = 0; x < canvas.width; x++) {
+      const y = canvas.height / 2 + Math.sin((x * 0.025) + phase + 1) * 15 + Math.cos((x * 0.04) + phase * 0.8) * 12;
+      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    phase += 0.03;
+  }
+  draw();
+}
+
+function stopProcessingAnimation() {
+  if (processingAnimFrame) { cancelAnimationFrame(processingAnimFrame); processingAnimFrame = null; }
+}
+
+// ── Share — motivacional, no la frase literal ─────────
+function shareAlzo() {
+  const lang = selectedLanguage || 'en-US';
+  const shareMessages = {
+    'en-US': `Just created my ALZO — a personal affirmation in my own voice. 🎙️\n\nEvery morning at 7am, I hear myself say exactly what I need.\n\nTry it: getalzo.com`,
+    'es-AR': `Acabo de crear mi ALZO — una afirmación personal en mi propia voz. 🎙️\n\nCada mañana a las 7am, me escucho decir exactamente lo que necesito.\n\nProbalo: getalzo.com`,
+    'pt-BR': `Acabei de criar meu ALZO — uma afirmação pessoal com minha própria voz. 🎙️\n\nToda manhã às 7h, me ouço dizer exatamente o que preciso.\n\nExperimente: getalzo.com`,
+  };
+
+  const shareText = shareMessages[lang];
+
+  if (navigator.share) {
+    navigator.share({ text: shareText }).catch(() => {});
+  } else {
+    navigator.clipboard.writeText(shareText).then(() => {
+      const btn = event.target;
+      const original = btn.textContent;
+      btn.textContent = lang === 'en-US' ? 'Copied!' : lang === 'es-AR' ? '¡Copiado!' : 'Copiado!';
+      setTimeout(() => btn.textContent = original, 2000);
+    });
   }
 }
 </script>

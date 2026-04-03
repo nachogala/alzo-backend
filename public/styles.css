@@ -26,7 +26,7 @@ html {
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: var(--bg);
   color: var(--text);
   min-height: 100dvh;
@@ -35,12 +35,31 @@ body {
   align-items: center;
 }
 
+/* ── Progress bar ────────────────────────────────────── */
+
+.progress-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 3px;
+  background: var(--bg-card);
+  z-index: 100;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, var(--purple), var(--purple-light));
+  transition: width 0.4s ease;
+}
+
 /* ── Layout ───────────────────────────────────────── */
 
 .container {
   width: 100%;
   max-width: var(--max-w);
-  padding: 2rem 1.25rem;
+  padding: 2rem 1.25rem 3rem;
   display: flex;
   flex-direction: column;
   min-height: 100dvh;
@@ -53,6 +72,7 @@ body {
   flex-direction: column;
   flex: 1;
   animation: fadeIn 0.4s ease;
+  gap: 0.75rem;
 }
 
 .screen.active {
@@ -64,6 +84,31 @@ body {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* ── Logo icon ───────────────────────────────────── */
+
+.logo {
+  font-size: 3rem;
+  margin-bottom: 0.5rem;
+}
+
+/* ── ALZO wordmark ───────────────────────────────── */
+
+.wordmark {
+  font-size: 2.5rem;
+  font-weight: 800;
+  letter-spacing: 0.3em;
+  background: linear-gradient(135deg, var(--purple-light), var(--purple));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: 1rem;
+}
+
+.wordmark-sm {
+  font-size: 1.25rem;
+  margin-bottom: 0.5rem;
+}
+
 /* ── Landing ──────────────────────────────────────── */
 
 .landing {
@@ -72,23 +117,11 @@ body {
   gap: 1.5rem;
 }
 
-.logo {
-  font-size: 2.5rem;
-  margin-bottom: 0.25rem;
-}
-
 .landing h1 {
   font-size: 2rem;
   line-height: 1.15;
   font-weight: 700;
   letter-spacing: -0.02em;
-}
-
-.landing h1 span {
-  background: linear-gradient(135deg, var(--purple-light), var(--purple));
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
 }
 
 .landing .sub {
@@ -107,6 +140,7 @@ body {
   padding: 0.9rem 1.75rem;
   border-radius: var(--radius);
   border: none;
+  font-family: inherit;
   font-size: 1rem;
   font-weight: 600;
   cursor: pointer;
@@ -161,32 +195,33 @@ body {
   color: var(--text-dim);
   font-size: 0.95rem;
   line-height: 1.5;
-  margin-bottom: 1.5rem;
+  margin-bottom: 1rem;
 }
 
-/* ── Textarea ─────────────────────────────────────── */
+/* ── Fallback text input ─────────────────────────── */
 
-textarea {
+.fallback-text {
   width: 100%;
-  min-height: 140px;
+  min-height: 60px;
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text);
-  font-size: 1rem;
-  padding: 1rem;
+  font-size: 0.9rem;
+  padding: 0.75rem 1rem;
   resize: vertical;
   font-family: inherit;
   line-height: 1.5;
   transition: border-color 0.2s;
+  margin-top: 1rem;
 }
 
-textarea:focus {
+.fallback-text:focus {
   outline: none;
   border-color: var(--purple);
 }
 
-textarea::placeholder {
+.fallback-text::placeholder {
   color: var(--text-dim);
 }
 
@@ -196,8 +231,16 @@ textarea::placeholder {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 1.25rem;
-  margin-top: 1rem;
+  gap: 1rem;
+  margin-top: 0.5rem;
+}
+
+.waveform {
+  width: 100%;
+  max-width: 300px;
+  height: 80px;
+  border-radius: 8px;
+  background: var(--bg);
 }
 
 .record-btn {
@@ -212,16 +255,45 @@ textarea::placeholder {
   justify-content: center;
   transition: all 0.2s;
   box-shadow: 0 0 0 0 var(--purple-glow);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  position: relative;
+  z-index: 10;
 }
 
 .record-btn:hover {
   transform: scale(1.05);
 }
 
+.record-btn .mic-icon {
+  display: block;
+}
+
+.record-btn .stop-icon {
+  display: none;
+}
+
+.record-btn.recording .mic-icon {
+  display: none;
+}
+
+.record-btn.recording .stop-icon {
+  display: block;
+}
+
 .record-btn.recording {
   animation: pulse 1.2s ease-in-out infinite;
   background: #ef4444;
   border-color: #fca5a5;
+}
+
+.record-btn.recorded {
+  background: #22c55e;
+  border-color: #86efac;
+}
+
+.record-btn.recorded .mic-icon path {
+  d: path("M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z");
 }
 
 @keyframes pulse {
@@ -247,17 +319,6 @@ textarea::placeholder {
   color: var(--purple-light);
 }
 
-.sample-text {
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1rem;
-  font-size: 0.9rem;
-  line-height: 1.7;
-  color: var(--text-dim);
-  margin-bottom: 0.5rem;
-}
-
 /* ── Processing ───────────────────────────────────── */
 
 .processing {
@@ -267,17 +328,11 @@ textarea::placeholder {
   gap: 2rem;
 }
 
-.spinner {
-  width: 56px;
-  height: 56px;
-  border: 4px solid var(--border);
-  border-top-color: var(--purple);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
+.processing-wave canvas {
+  width: 100%;
+  max-width: 300px;
+  height: 100px;
+  border-radius: 8px;
 }
 
 .processing p {
@@ -288,7 +343,7 @@ textarea::placeholder {
 /* ── Result ───────────────────────────────────────── */
 
 .result {
-  gap: 1.5rem;
+  gap: 1.25rem;
 }
 
 .affirmation-card {
@@ -311,15 +366,8 @@ audio {
 }
 
 .cta-final {
-  text-align: center;
   margin-top: auto;
-  padding: 2rem 0 1rem;
-}
-
-.cta-final p {
-  color: var(--text-dim);
-  font-size: 0.9rem;
-  margin-bottom: 1rem;
+  padding: 1.5rem 0 1rem;
 }
 
 /* ── Spacer helpers ───────────────────────────────── */

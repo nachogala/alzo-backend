@@ -1,7 +1,7 @@
 {
-  "name": "innervoice",
+  "name": "alzo",
   "version": "1.0.0",
-  "description": "AI app that clones your voice and generates personalized daily affirmations",
+  "description": "ALZO - Rise in your own voice",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

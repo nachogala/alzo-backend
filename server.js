@@ -297,9 +297,7 @@ async function generateSpeech(text, voiceId, language) {
 const onboardingUpload = upload.fields([
   { name: "q1", maxCount: 1 },
   { name: "q2", maxCount: 1 },
-  { name: "q3", maxCount: 1 },
-  { name: "q4", maxCount: 1 },
-  { name: "q5", maxCount: 1 },
+  { name: "voiceSample", maxCount: 1 }, // dedicated 30s reading for voice clone
 ]);
 
 // ── Transcribe audio with Whisper ────────────────────────────────────
@@ -372,8 +370,9 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     };
 
     const audioFiles = [];
-    const questionKeys = ['goal', 'identity', 'blocker', 'strength', 'selfMessage'];
-    const uploadKeys = ['q1', 'q2', 'q3', 'q4', 'q5'];
+    // New funnel: q1=goal, q2=weekGoal + dedicated voiceSample for cloning
+    const questionKeys = ['goal', 'weekGoal'];
+    const uploadKeys = ['q1', 'q2'];
     const transcriptions = [];
 
     for (let i = 0; i < uploadKeys.length; i++) {
@@ -381,8 +380,6 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
       if (req.files && req.files[key] && req.files[key][0]) {
         const filePath = req.files[key][0].path;
         audioFiles.push(filePath);
-
-        // Pass language so Whisper transcribes in the correct language
         const transcription = await transcribeAudio(filePath, language);
         if (transcription && transcription.trim().length > 5) {
           context[questionKeys[i]] = transcription;
@@ -396,9 +393,15 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     const detectedGender = await detectGender(transcriptions);
     console.log('Detected gender:', detectedGender);
 
+    // Priority: use dedicated voiceSample for cloning (better quality)
+    // Fall back to last question audio if no voiceSample
     let combinedVoicePath = null;
-    if (audioFiles.length > 0) {
+    if (req.files && req.files['voiceSample'] && req.files['voiceSample'][0]) {
+      combinedVoicePath = req.files['voiceSample'][0].path;
+      console.log('Using dedicated voice sample for cloning');
+    } else if (audioFiles.length > 0) {
       combinedVoicePath = audioFiles[audioFiles.length - 1];
+      console.log('Using question audio for cloning (no dedicated sample)');
     }
 
     let voiceReady = !!(combinedVoicePath && ELEVENLABS_API_KEY);

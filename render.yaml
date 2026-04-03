@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: alzo-backend
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js

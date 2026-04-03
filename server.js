@@ -367,9 +367,9 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     };
 
     const audioFiles = [];
-    // v3 final: intro (q1=who you are), weekGoal (q2=this week), bigDream (q3=long term)
-    const questionKeys = ['intro', 'weekGoal', 'bigDream'];
-    const uploadKeys = ['q1', 'q2', 'q3'];
+    // v3 final: intro (q1), weekGoal (q2), bigDream (q3), weekFocusAudio (q4)
+    const questionKeys = ['intro', 'weekGoal', 'bigDream', 'weekFocusAudio'];
+    const uploadKeys = ['q1', 'q2', 'q3', 'q4'];
     const transcriptions = [];
 
     for (let i = 0; i < uploadKeys.length; i++) {

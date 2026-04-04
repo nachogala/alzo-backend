@@ -107,11 +107,12 @@ const WHISPER_LANGUAGE = {
 };
 
 async function generateAffirmation(context, language) {
-  const { goal, goal90, mood, intro, weekGoal, whyItMatters, weeklyGoal, weekFocus, identity, blocker, vision, strength } = context;
+  const { goal, goal90, mood, intro, weekGoal, bigGoal, whyItMatters, weeklyGoal, weekFocus, identity, blocker, vision, strength } = context;
 
   const contextBlock = [
-    (weekGoal || weeklyGoal || weekFocus) && `⭐ THIS WEEK'S GOAL (most important): ${weekGoal || weeklyGoal || weekFocus}`,
-    whyItMatters && `Why it matters to them (emotional fuel): ${whyItMatters}`,
+    (bigGoal || goal90) && `🎯 90-DAY GOAL: ${bigGoal || goal90}`,
+    (weekGoal || weeklyGoal || weekFocus) && `⭐ THIS WEEK'S FOCUS (most important): ${weekGoal || weeklyGoal || weekFocus}`,
+    whyItMatters && `Why it matters (emotional fuel): ${whyItMatters}`,
     intro && `Who they are (extract name from this): ${intro}`,
     (vision || goal || goal90) && `Long-term: ${vision || goal || goal90}`,
   ]
@@ -383,8 +384,8 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     };
 
     const audioFiles = [];
-    // v3 FINAL: intro (q1=who you are), weekGoal (q2=this week), whyItMatters (q3=why)
-    const questionKeys = ['intro', 'weekGoal', 'whyItMatters'];
+    // v4: intro (q1=who), bigGoal (q2=90 days), weekFocus (q3=this week), whyItMatters (q4=why)
+    const questionKeys = ['intro', 'bigGoal', 'weekFocus', 'whyItMatters'];
     const uploadKeys = ['q1', 'q2', 'q3'];
     const transcriptions = [];
 

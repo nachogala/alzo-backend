@@ -386,7 +386,7 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     const audioFiles = [];
     // v4: intro (q1=who), bigGoal (q2=90 days), weekFocus (q3=this week), whyItMatters (q4=why)
     const questionKeys = ['intro', 'bigGoal', 'weekFocus', 'whyItMatters'];
-    const uploadKeys = ['q1', 'q2', 'q3'];
+    const uploadKeys = ['q1', 'q2', 'q3', 'q4'];
     const transcriptions = [];
 
     for (let i = 0; i < uploadKeys.length; i++) {
@@ -500,6 +500,18 @@ app.post("/api/auth/signup", (req, res) => {
   stmts.insert.run(userId, email.toLowerCase(), name || null, hashPassword(password), token);
 
   res.json({ token, userId });
+});
+
+app.post("/api/auth/reset-password", (req, res) => {
+  const { email, newPassword } = req.body;
+  if (!email || !newPassword) return res.status(400).json({ error: "Email and new password are required" });
+  if (newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+
+  const user = stmts.getByEmail.get(email.toLowerCase());
+  if (!user) return res.status(404).json({ error: "Account not found" });
+
+  db.prepare("UPDATE users SET passwordHash = ? WHERE email = ?").run(hashPassword(newPassword), email.toLowerCase());
+  res.json({ success: true });
 });
 
 app.post("/api/auth/login", (req, res) => {

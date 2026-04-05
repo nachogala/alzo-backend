@@ -192,23 +192,40 @@ function withTimeout(promise, ms) {
 }
 
 async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language) {
-  if (!ELEVENLABS_API_KEY) return null;
+  const debug = {
+    cloneMode: 'not_attempted',
+    sampleCount: Array.isArray(voiceFilePath) ? voiceFilePath.length : (voiceFilePath ? 1 : 0),
+    sampleFiles: (Array.isArray(voiceFilePath) ? voiceFilePath : [voiceFilePath]).filter(Boolean).map(fp => path.basename(fp)),
+    fallbackUsed: false,
+    fallbackBlocked: false,
+    customVoiceId: null,
+    playbackVoiceId: null,
+    modelId: null,
+    error: null,
+  };
+
+  if (!ELEVENLABS_API_KEY) {
+    debug.cloneMode = 'disabled';
+    debug.error = 'ELEVENLABS_API_KEY missing';
+    return { audioUrl: null, voiceDebug: debug };
+  }
 
   try {
-    // Step 1: Add a cloned voice using Instant Voice Cloning
     const formData = new FormData();
     formData.append("name", `alzo_${Date.now()}`);
     formData.append("description", "ALZO user voice clone for affirmations");
-    // Send all available voice files for better clone quality
     if (Array.isArray(voiceFilePath)) {
       voiceFilePath.forEach((fp, i) => {
         const buf = fs.readFileSync(fp);
         formData.append("files", new Blob([buf], { type: "audio/m4a" }), `sample_${i}.m4a`);
       });
-    } else {
+    } else if (voiceFilePath) {
       const fileBuffer = fs.readFileSync(voiceFilePath);
       formData.append("files", new Blob([fileBuffer], { type: "audio/m4a" }), "voice_sample.m4a");
     }
+
+    debug.cloneMode = 'clone_attempted';
+    console.log('Voice clone samples:', debug.sampleFiles);
 
     const addVoiceRes = await withTimeout(fetch(`${ELEVENLABS_BASE}/voices/add`, {
       method: "POST",
@@ -217,29 +234,41 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language) {
     }), 25000);
 
     if (!addVoiceRes || !addVoiceRes.ok) {
-      console.error("Voice clone failed:", await addVoiceRes.text());
-      return await textToSpeechFallback(text, gender, language);
+      const errorText = addVoiceRes ? await addVoiceRes.text() : 'timeout adding voice';
+      console.error("Voice clone failed:", errorText);
+      debug.cloneMode = 'clone_failed';
+      debug.error = errorText;
+      debug.fallbackBlocked = true;
+      return { audioUrl: null, voiceDebug: debug };
     }
 
     const { voice_id } = await addVoiceRes.json();
+    debug.customVoiceId = voice_id;
+    debug.playbackVoiceId = voice_id;
+    debug.cloneMode = 'cloned';
 
-    // Step 2: Generate speech with the cloned voice (30s timeout)
-    const audioUrl = await withTimeout(generateSpeech(text, voice_id, language), 30000);
-    if (!audioUrl) {
+    const speech = await withTimeout(generateSpeech(text, voice_id, language), 30000);
+    if (!speech || !speech.audioUrl) {
       fetch(`${ELEVENLABS_BASE}/voices/${voice_id}`, { method: 'DELETE', headers: { 'xi-api-key': ELEVENLABS_API_KEY } }).catch(() => {});
-      return await textToSpeechFallback(text, gender, language);
+      debug.cloneMode = 'tts_failed_after_clone';
+      debug.error = 'speech generation failed after clone';
+      debug.fallbackBlocked = true;
+      return { audioUrl: null, voiceDebug: debug };
     }
 
-    // Step 3: Clean up — delete the cloned voice
+    debug.modelId = speech.modelId;
     fetch(`${ELEVENLABS_BASE}/voices/${voice_id}`, {
       method: "DELETE",
       headers: { "xi-api-key": ELEVENLABS_API_KEY },
     }).catch(() => {});
 
-    return audioUrl;
+    return { audioUrl: speech.audioUrl, voiceDebug: debug };
   } catch (err) {
     console.error("ElevenLabs clone error:", err.message);
-    return await textToSpeechFallback(text, gender, language);
+    debug.cloneMode = 'clone_error';
+    debug.error = err.message;
+    debug.fallbackBlocked = true;
+    return { audioUrl: null, voiceDebug: debug };
   }
 }
 
@@ -263,15 +292,26 @@ const PRESET_VOICES = PRESET_VOICES_BY_LANGUAGE['en-US'];
 
 // ── ElevenLabs: TTS with a preset voice (fallback) ──────────────────
 async function textToSpeechFallback(text, gender, language) {
-  if (!ELEVENLABS_API_KEY) return null;
+  if (!ELEVENLABS_API_KEY) return { audioUrl: null, voiceDebug: { cloneMode: 'disabled', fallbackUsed: false, error: 'ELEVENLABS_API_KEY missing' } };
 
   try {
     const voices = PRESET_VOICES_BY_LANGUAGE[language] || PRESET_VOICES_BY_LANGUAGE['en-US'];
     const voiceId = voices[gender] || voices.female;
-    return await generateSpeech(text, voiceId, language);
+    const speech = await generateSpeech(text, voiceId, language);
+    return {
+      audioUrl: speech.audioUrl,
+      voiceDebug: {
+        cloneMode: 'fallback',
+        fallbackUsed: true,
+        customVoiceId: null,
+        playbackVoiceId: voiceId,
+        modelId: speech.modelId,
+        error: null,
+      }
+    };
   } catch (err) {
     console.error("ElevenLabs TTS fallback error:", err.message);
-    return null;
+    return { audioUrl: null, voiceDebug: { cloneMode: 'fallback_failed', fallbackUsed: true, error: err.message } };
   }
 }
 
@@ -303,7 +343,7 @@ async function generateSpeech(text, voiceId, language) {
   const filename = `affirmation_${Date.now()}.mp3`;
   const filepath = path.join(__dirname, "public", "audio", filename);
   fs.writeFileSync(filepath, audioBuffer);
-  return `/audio/${filename}`;
+  return { audioUrl: `/audio/${filename}`, voiceId, modelId: model };
 }
 
 // ── Onboarding endpoint ─────────────────────────────────────────────
@@ -376,6 +416,7 @@ async function detectGender(transcriptions) {
 app.post("/api/onboarding", onboardingUpload, async (req, res) => {
   try {
     const language = req.body.language || 'en-US';
+    const answerMeta = (() => { try { return JSON.parse(req.body.answerMeta || '{}'); } catch { return {}; } })();
 
     let context = {
       blocker: "",
@@ -421,22 +462,34 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     let voiceReady = !!((audioFiles.length > 0 || combinedVoicePath) && ELEVENLABS_API_KEY);
 
     const sessionId = Date.now().toString();
+    const voiceDebug = {
+      cloneMode: voiceReady ? 'pending' : 'not_ready',
+      sampleCount: 0,
+      sampleFiles: [],
+      answerMeta,
+      fallbackUsed: false,
+      customVoiceId: null,
+      playbackVoiceId: null,
+      modelId: null,
+      error: null,
+    };
     // Save ALL audio files for richer voice cloning
     const allVoiceFiles = [...audioFiles];
     if (combinedVoicePath && !allVoiceFiles.includes(combinedVoicePath)) {
       allVoiceFiles.push(combinedVoicePath);
     }
+    voiceDebug.sampleCount = allVoiceFiles.length;
+    voiceDebug.sampleFiles = allVoiceFiles.map(f => path.basename(f));
+
     if (allVoiceFiles.length > 0) {
-      // Save paths list to a JSON file so generate-affirmation can find all samples
       const voiceManifest = path.join(__dirname, "uploads", `voice_manifest_${sessionId}.json`);
       fs.writeFileSync(voiceManifest, JSON.stringify(allVoiceFiles));
-      // Also copy primary for backwards compat
       const destPath = path.join(__dirname, "uploads", `voice_${sessionId}.m4a`);
       fs.copyFileSync(allVoiceFiles[allVoiceFiles.length - 1], destPath);
       allVoiceFiles.forEach((f) => { if (f !== destPath) fs.unlink(f, () => {}); });
-      res.json({ voiceReady, context, sessionId, detectedGender, language });
+      res.json({ voiceReady, context, sessionId, detectedGender, language, voiceDebug });
     } else {
-      res.json({ voiceReady, context, sessionId, detectedGender, language });
+      res.json({ voiceReady, context, sessionId, detectedGender, language, voiceDebug });
     }
   } catch (err) {
     console.error("Onboarding error:", err);
@@ -458,6 +511,7 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
 
     // 2. Generate audio — use all voice samples if available
     let audioUrl = null;
+    let voiceDebug = { cloneMode: 'not_ready', fallbackUsed: false, error: null };
     const manifestPath = path.join(__dirname, "uploads", `voice_manifest_${sessionId}.json`);
     const voicePathM4a = path.join(__dirname, "uploads", `voice_${sessionId}.m4a`);
     const voicePathWebm = path.join(__dirname, "uploads", `voice_${sessionId}.webm`);
@@ -473,13 +527,17 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
         } catch {}
         fs.unlink(manifestPath, () => {});
       }
-      audioUrl = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language);
+      const cloneResult = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language);
+      audioUrl = cloneResult.audioUrl;
+      voiceDebug = cloneResult.voiceDebug;
       fs.unlink(voicePath, () => {});
     } else {
-      audioUrl = await textToSpeechFallback(affirmationText, gender, language);
+      const fallbackResult = await textToSpeechFallback(affirmationText, gender, language);
+      audioUrl = fallbackResult.audioUrl;
+      voiceDebug = fallbackResult.voiceDebug;
     }
 
-    res.json({ affirmationText, audioUrl });
+    res.json({ affirmationText, audioUrl, voiceDebug });
   } catch (err) {
     console.error("Error generating affirmation:", err);
     res.status(500).json({ error: "Failed to generate affirmation" });

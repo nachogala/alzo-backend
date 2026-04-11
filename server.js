@@ -802,13 +802,58 @@ app.get("/api/goals", (req, res) => {
   res.json({ goals });
 });
 
-app.post("/api/goals/:id/complete", (req, res) => {
+app.post("/api/goals/:id/complete", async (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
   const goal = stmts.getGoal.get(req.params.id, user.id);
   if (!goal) return res.status(404).json({ error: "Goal not found" });
   stmts.completeGoal.run(goal.id);
-  res.json({ success: true });
+
+  // Generate chronicle and move plant to garden
+  try {
+    const plants = stmts.getActivePlants.all(user.id);
+    const goalPlant = plants.find(p => p.goalId === goal.id);
+    const checkins = stmts.getRecentCheckins.all(user.id, 90);
+    const alignedDays = checkins.filter(c => c.alignment === 'yes' || c.alignment === 'mostly').length;
+
+    const chronicleRes = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "system",
+          content: `You write short, powerful achievement stories for the ALZO app. 3-4 sentences. Like a narrator telling someone's journey. Premium, emotional, grounded. Use the user's name. Write in ${user.language || 'en-US'}.`
+        },
+        {
+          role: "user",
+          content: `Write a chronicle for completing this goal.
+Name: ${user.name || 'User'}
+Goal: ${goal.description}
+Days active: ${checkins.length}
+Aligned days: ${alignedDays}
+Plant: ${goalPlant?.species || 'unknown'} named "${goalPlant?.name || 'companion'}"`
+        }
+      ],
+      temperature: 0.8,
+      max_tokens: 200,
+    });
+
+    const chronicle = chronicleRes.choices[0].message.content.trim();
+
+    if (goalPlant) {
+      stmts.movePlantToGarden.run(goalPlant.id);
+      const gardenId = crypto.randomUUID();
+      stmts.insertGarden.run(gardenId, user.id, goalPlant.id, goal.id, chronicle);
+    }
+
+    // Create goal completion milestone
+    const milestoneId = crypto.randomUUID();
+    stmts.insertMilestone.run(milestoneId, user.id, goal.id, 'goal_completed', 'Goal Completed', chronicle, checkins.length);
+
+    res.json({ success: true, chronicle });
+  } catch (err) {
+    console.error('Chronicle generation error:', err.message);
+    res.json({ success: true, chronicle: null });
+  }
 });
 
 // Check-in

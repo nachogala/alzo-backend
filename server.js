@@ -25,7 +25,120 @@ db.exec(`
     streak INTEGER DEFAULT 0,
     language TEXT DEFAULT 'en-US',
     plan TEXT DEFAULT 'Free Trial',
+    notificationHour INTEGER DEFAULT 7,
+    notificationMinute INTEGER DEFAULT 0,
     createdAt TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS goals (
+    id TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'long', -- 'long' (90d) or 'short' (7d)
+    description TEXT,
+    audioUrl TEXT,
+    motivation TEXT,
+    motivationAudioUrl TEXT,
+    horizonDays INTEGER DEFAULT 90,
+    startDate TEXT DEFAULT (datetime('now')),
+    targetDate TEXT,
+    status TEXT DEFAULT 'active', -- active, completed, abandoned
+    completedAt TEXT,
+    FOREIGN KEY (userId) REFERENCES users(id)
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS checkins (
+    id TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    goalId TEXT,
+    intentionConfirmed INTEGER DEFAULT 1,
+    emotionalState TEXT, -- centered, restless, shutdown, avoiding, activated
+    energyLevel INTEGER DEFAULT 3, -- 1-5
+    alignment TEXT, -- yes, mostly, no, avoided
+    microcommitment TEXT,
+    createdAt TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (userId) REFERENCES users(id),
+    FOREIGN KEY (goalId) REFERENCES goals(id)
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS plants (
+    id TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    goalId TEXT NOT NULL,
+    species TEXT NOT NULL, -- monstera, orchid, lavender, etc.
+    name TEXT, -- user-given name
+    color TEXT DEFAULT '#6B4EFF', -- user-chosen accent color
+    health REAL DEFAULT 1.0, -- 0.0 to 1.0
+    growthStage REAL DEFAULT 0.0, -- 0.0 to 1.0
+    lastCheckIn TEXT,
+    status TEXT DEFAULT 'active', -- active, garden, withered
+    createdAt TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (userId) REFERENCES users(id),
+    FOREIGN KEY (goalId) REFERENCES goals(id)
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS garden (
+    id TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    plantId TEXT NOT NULL,
+    goalId TEXT NOT NULL,
+    chronicle TEXT, -- the story generated when goal is completed
+    unlockedAt TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (userId) REFERENCES users(id),
+    FOREIGN KEY (plantId) REFERENCES plants(id),
+    FOREIGN KEY (goalId) REFERENCES goals(id)
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS journal_entries (
+    id TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    goalId TEXT,
+    audioUrl TEXT,
+    duration INTEGER, -- seconds
+    createdAt TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (userId) REFERENCES users(id)
+  );
+`);
+
+// Add color column if missing (migration for existing DBs)
+try { db.exec("ALTER TABLE plants ADD COLUMN color TEXT DEFAULT '#6B4EFF'"); } catch {}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS milestones (
+    id TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    goalId TEXT,
+    type TEXT NOT NULL, -- 'streak_7', 'streak_30', 'streak_60', 'goal_completed', 'first_checkin', 'garden_first'
+    title TEXT,
+    narrative TEXT, -- AI-generated narrative summary
+    dayNumber INTEGER, -- which day this milestone was reached
+    unlockedAt TEXT DEFAULT (datetime('now')),
+    shared INTEGER DEFAULT 0,
+    FOREIGN KEY (userId) REFERENCES users(id)
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    goalId TEXT,
+    text TEXT,
+    audioUrl TEXT,
+    tone TEXT DEFAULT 'grounding', -- grounding, mirror, push
+    listenedAt TEXT,
+    listenedFull INTEGER DEFAULT 0,
+    createdAt TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (userId) REFERENCES users(id)
   );
 `);
 
@@ -36,7 +149,41 @@ const stmts = {
   insert: db.prepare("INSERT INTO users (id, email, name, passwordHash, token, streak, language, plan) VALUES (?, ?, ?, ?, ?, 0, 'en-US', 'Free Trial')"),
   updateToken: db.prepare("UPDATE users SET token = ? WHERE email = ?"),
   updatePlan: db.prepare("UPDATE users SET plan = ? WHERE email = ?"),
+  updateNotification: db.prepare("UPDATE users SET notificationHour = ?, notificationMinute = ? WHERE id = ?"),
   deleteUser: db.prepare("DELETE FROM users WHERE email = ?"),
+  // Goals
+  insertGoal: db.prepare("INSERT INTO goals (id, userId, type, description, audioUrl, motivation, motivationAudioUrl, horizonDays, targetDate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+  getActiveGoals: db.prepare("SELECT * FROM goals WHERE userId = ? AND status = 'active' ORDER BY type ASC"),
+  getGoal: db.prepare("SELECT * FROM goals WHERE id = ? AND userId = ?"),
+  completeGoal: db.prepare("UPDATE goals SET status = 'completed', completedAt = datetime('now') WHERE id = ?"),
+  // Check-ins
+  insertCheckin: db.prepare("INSERT INTO checkins (id, userId, goalId, intentionConfirmed, emotionalState, energyLevel, alignment, microcommitment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
+  getRecentCheckins: db.prepare("SELECT * FROM checkins WHERE userId = ? ORDER BY createdAt DESC LIMIT ?"),
+  getTodayCheckin: db.prepare("SELECT * FROM checkins WHERE userId = ? AND date(createdAt) = date('now') LIMIT 1"),
+  // Plants
+  insertPlant: db.prepare("INSERT INTO plants (id, userId, goalId, species, name, color) VALUES (?, ?, ?, ?, ?, ?)"),
+  getActivePlants: db.prepare("SELECT * FROM plants WHERE userId = ? AND status = 'active'"),
+  getPlant: db.prepare("SELECT * FROM plants WHERE id = ? AND userId = ?"),
+  updatePlantHealth: db.prepare("UPDATE plants SET health = ?, growthStage = ?, lastCheckIn = datetime('now') WHERE id = ?"),
+  updatePlantName: db.prepare("UPDATE plants SET name = ? WHERE id = ? AND userId = ?"),
+  movePlantToGarden: db.prepare("UPDATE plants SET status = 'garden' WHERE id = ?"),
+  // Garden
+  insertGarden: db.prepare("INSERT INTO garden (id, userId, plantId, goalId, chronicle) VALUES (?, ?, ?, ?, ?)"),
+  getGarden: db.prepare("SELECT g.*, p.species, p.name as plantName FROM garden g JOIN plants p ON g.plantId = p.id WHERE g.userId = ? ORDER BY g.unlockedAt DESC"),
+  // Journal
+  insertJournal: db.prepare("INSERT INTO journal_entries (id, userId, goalId, audioUrl, duration) VALUES (?, ?, ?, ?, ?)"),
+  getJournal: db.prepare("SELECT * FROM journal_entries WHERE userId = ? ORDER BY createdAt DESC LIMIT ?"),
+  // Messages
+  insertMessage: db.prepare("INSERT INTO messages (id, userId, goalId, text, audioUrl, tone) VALUES (?, ?, ?, ?, ?, ?)"),
+  getTodayMessage: db.prepare("SELECT * FROM messages WHERE userId = ? AND date(createdAt) = date('now') ORDER BY createdAt DESC LIMIT 1"),
+  markListened: db.prepare("UPDATE messages SET listenedAt = datetime('now'), listenedFull = ? WHERE id = ?"),
+  // Milestones
+  insertMilestone: db.prepare("INSERT INTO milestones (id, userId, goalId, type, title, narrative, dayNumber) VALUES (?, ?, ?, ?, ?, ?, ?)"),
+  getMilestones: db.prepare("SELECT * FROM milestones WHERE userId = ? ORDER BY unlockedAt DESC"),
+  getMilestoneByType: db.prepare("SELECT * FROM milestones WHERE userId = ? AND type = ? LIMIT 1"),
+  markMilestoneShared: db.prepare("UPDATE milestones SET shared = 1 WHERE id = ?"),
+  // Plant with color
+  updatePlantColor: db.prepare("UPDATE plants SET color = ? WHERE id = ? AND userId = ?"),
 };
 
 function hashPassword(password) {
@@ -590,6 +737,8 @@ app.post("/api/auth/login", (req, res) => {
 app.get("/api/user/profile", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
+  // Decay plants on profile load (handles users who missed days)
+  decayPlantHealth(user.id);
   res.json({ email: user.email, name: user.name, streak: user.streak, language: user.language, plan: user.plan });
 });
 
@@ -627,8 +776,337 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// ── ALIGNMENT SYSTEM ENDPOINTS ──────────────────────────────────────
+
+// Goals
+app.post("/api/goals", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const { type, description, audioUrl, motivation, motivationAudioUrl, horizonDays } = req.body;
+  const id = crypto.randomUUID();
+  const targetDate = new Date(Date.now() + (horizonDays || 90) * 86400000).toISOString();
+  stmts.insertGoal.run(id, user.id, type || 'long', description, audioUrl, motivation, motivationAudioUrl, horizonDays || 90, targetDate);
+  res.json({ id, success: true });
+});
+
+app.get("/api/goals", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const goals = stmts.getActiveGoals.all(user.id);
+  res.json({ goals });
+});
+
+app.post("/api/goals/:id/complete", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const goal = stmts.getGoal.get(req.params.id, user.id);
+  if (!goal) return res.status(404).json({ error: "Goal not found" });
+  stmts.completeGoal.run(goal.id);
+  res.json({ success: true });
+});
+
+// Check-in
+app.post("/api/checkin", async (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const { goalId, intentionConfirmed, emotionalState, energyLevel, alignment, microcommitment } = req.body;
+  const id = crypto.randomUUID();
+  stmts.insertCheckin.run(id, user.id, goalId, intentionConfirmed ? 1 : 0, emotionalState, energyLevel || 3, alignment, microcommitment);
+
+  // Decay plants that haven't been checked in (subtle withering)
+  decayPlantHealth(user.id);
+
+  // Update plant health based on alignment
+  const plants = stmts.getActivePlants.all(user.id);
+  for (const plant of plants) {
+    if (plant.goalId === goalId || !goalId) {
+      let healthDelta = 0;
+      let growthDelta = 0;
+      if (alignment === 'yes') { healthDelta = 0.05; growthDelta = 0.02; }
+      else if (alignment === 'mostly') { healthDelta = 0.02; growthDelta = 0.01; }
+      else if (alignment === 'no') { healthDelta = -0.02; growthDelta = 0; }
+      else if (alignment === 'avoided') { healthDelta = -0.04; growthDelta = 0; }
+      const newHealth = Math.max(0, Math.min(1, plant.health + healthDelta));
+      const newGrowth = Math.min(1, plant.growthStage + growthDelta);
+      stmts.updatePlantHealth.run(newHealth, newGrowth, plant.id);
+    }
+  }
+
+  // Update streak
+  db.prepare("UPDATE users SET streak = streak + 1 WHERE id = ?").run(user.id);
+
+  // Check for new milestones (async, don't block response)
+  const updatedUser = stmts.getByToken.get(user.token);
+  const newMilestones = await checkMilestones(updatedUser).catch(() => []);
+
+  res.json({ id, success: true, plantUpdated: plants.length > 0, newMilestones });
+});
+
+app.get("/api/checkin/today", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const checkin = stmts.getTodayCheckin.get(user.id);
+  res.json({ checkin: checkin || null, completed: !!checkin });
+});
+
+// Mirror
+app.get("/api/mirror", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const goals = stmts.getActiveGoals.all(user.id);
+  const recentCheckins = stmts.getRecentCheckins.all(user.id, 7);
+
+  const primaryGoal = goals.find(g => g.type === 'long') || goals[0];
+  const lastCheckin = recentCheckins[0];
+
+  // Calculate alignment score for the week
+  const alignedCount = recentCheckins.filter(c => c.alignment === 'yes' || c.alignment === 'mostly').length;
+  const totalCheckins = recentCheckins.length;
+  const alignmentScore = totalCheckins > 0 ? Math.round((alignedCount / totalCheckins) * 100) : 0;
+
+  // Determine dominant mood
+  const moods = recentCheckins.map(c => c.emotionalState).filter(Boolean);
+  const moodCounts = {};
+  moods.forEach(m => { moodCounts[m] = (moodCounts[m] || 0) + 1; });
+  const dominantMood = Object.entries(moodCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'unknown';
+
+  res.json({
+    intention: primaryGoal?.description || null,
+    lastState: lastCheckin?.emotionalState || null,
+    lastEnergy: lastCheckin?.energyLevel || null,
+    lastAlignment: lastCheckin?.alignment || null,
+    alignmentScore,
+    dominantMood,
+    daysActive: totalCheckins,
+    goalDaysRemaining: primaryGoal ? Math.max(0, Math.ceil((new Date(primaryGoal.targetDate) - Date.now()) / 86400000)) : null,
+    goalProgress: primaryGoal ? Math.round(((primaryGoal.horizonDays - Math.max(0, Math.ceil((new Date(primaryGoal.targetDate) - Date.now()) / 86400000))) / primaryGoal.horizonDays) * 100) : 0,
+  });
+});
+
+// Plants
+app.post("/api/plants", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const { goalId, species, name, color } = req.body;
+  const id = crypto.randomUUID();
+  stmts.insertPlant.run(id, user.id, goalId, species, name, color || '#6B4EFF');
+  res.json({ id, success: true });
+});
+
+app.get("/api/plants", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const plants = stmts.getActivePlants.all(user.id);
+  res.json({ plants });
+});
+
+app.put("/api/plants/:id/name", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  stmts.updatePlantName.run(req.body.name, req.params.id, user.id);
+  res.json({ success: true });
+});
+
+// Garden
+app.get("/api/garden", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const entries = stmts.getGarden.all(user.id);
+  res.json({ garden: entries });
+});
+
+// Journal
+app.post("/api/journal", upload.single("audio"), (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const id = crypto.randomUUID();
+  const audioUrl = req.file ? `/uploads/${req.file.filename}` : null;
+  const duration = parseInt(req.body.duration) || 0;
+  stmts.insertJournal.run(id, user.id, req.body.goalId, audioUrl, duration);
+  res.json({ id, success: true });
+});
+
+app.get("/api/journal", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const limit = parseInt(req.query.limit) || 20;
+  const entries = stmts.getJournal.all(user.id, limit);
+  res.json({ entries });
+});
+
+// Messages
+app.get("/api/message/today", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const message = stmts.getTodayMessage.get(user.id);
+  res.json({ message: message || null });
+});
+
+app.post("/api/message/:id/listened", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  stmts.markListened.run(req.body.full ? 1 : 0, req.params.id);
+  res.json({ success: true });
+});
+
+// Notification schedule
+app.put("/api/user/notification", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const { hour, minute } = req.body;
+  stmts.updateNotification.run(hour || 7, minute || 0, user.id);
+  res.json({ success: true });
+});
+
+// ── Plant species list ──────────────────────────────────────────────
+const PLANT_SPECIES = [
+  { id: "pothos", name: "Pothos", meaning: "Growth and resilience", rarity: "common" },
+  { id: "monstera", name: "Monstera", meaning: "Expansion and abundance", rarity: "common" },
+  { id: "peace_lily", name: "Peace Lily", meaning: "Peace and renewal", rarity: "common" },
+  { id: "snake_plant", name: "Snake Plant", meaning: "Strength and constancy", rarity: "common" },
+  { id: "lavender", name: "Lavender", meaning: "Calm and clarity", rarity: "common" },
+  { id: "jade", name: "Jade Plant", meaning: "Prosperity", rarity: "common" },
+  { id: "orchid", name: "Orchid", meaning: "Beauty and refinement", rarity: "rare" },
+  { id: "bird_paradise", name: "Bird of Paradise", meaning: "Freedom and expression", rarity: "rare" },
+  { id: "anthurium", name: "Anthurium", meaning: "Vitality and passion", rarity: "rare" },
+  { id: "ficus", name: "Ficus Lyrata", meaning: "Presence and elevation", rarity: "rare" },
+  { id: "calathea", name: "Calathea", meaning: "Balance and ritual", rarity: "rare" },
+  { id: "olive", name: "Olive Tree", meaning: "Wisdom and longevity", rarity: "epic" },
+  { id: "maple", name: "Japanese Maple", meaning: "Transformation and elegance", rarity: "epic" },
+  { id: "rosemary", name: "Rosemary", meaning: "Memory and focus", rarity: "epic" },
+  { id: "blue_orchid", name: "Blue Orchid", meaning: "Singularity and aspiration", rarity: "epic" },
+];
+
+app.get("/api/plants/species", (req, res) => {
+  res.json({ species: PLANT_SPECIES });
+});
+
+// ── Milestone narrative generation ──────────────────────────────────
+async function generateMilestoneNarrative(user, milestone, goals, checkins) {
+  const primaryGoal = goals.find(g => g.type === 'long') || goals[0];
+  const alignedDays = checkins.filter(c => c.alignment === 'yes' || c.alignment === 'mostly').length;
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      {
+        role: "system",
+        content: `You write short, powerful milestone narratives for the ALZO app. 2-3 sentences max. Celebratory but grounded. Premium tone — no cheesy motivational quotes. Use the user's name if available. Write in the language matching the user's preference (${user.language || 'en-US'}).`
+      },
+      {
+        role: "user",
+        content: `Generate a milestone narrative.
+Name: ${user.name || 'User'}
+Milestone: ${milestone.type} (day ${milestone.dayNumber})
+Goal: ${primaryGoal?.description || 'personal growth'}
+Aligned days: ${alignedDays} out of ${checkins.length}
+Streak: ${user.streak}`
+      }
+    ],
+    temperature: 0.8,
+    max_tokens: 150,
+  });
+
+  return response.choices[0].message.content.trim();
+}
+
+// Check and unlock milestones after check-in
+async function checkMilestones(user) {
+  const MILESTONE_DAYS = [
+    { day: 1, type: 'first_checkin', title: 'First Step' },
+    { day: 7, type: 'streak_7', title: '7 Days Strong' },
+    { day: 30, type: 'streak_30', title: '30 Day Milestone' },
+    { day: 60, type: 'streak_60', title: '60 Day Milestone' },
+  ];
+
+  const newMilestones = [];
+  for (const m of MILESTONE_DAYS) {
+    if (user.streak >= m.day) {
+      const existing = stmts.getMilestoneByType.get(user.id, m.type);
+      if (!existing) {
+        const goals = stmts.getActiveGoals.all(user.id);
+        const checkins = stmts.getRecentCheckins.all(user.id, m.day);
+        let narrative = null;
+        try {
+          narrative = await generateMilestoneNarrative(user, { type: m.type, dayNumber: m.day }, goals, checkins);
+        } catch (err) {
+          console.error('Milestone narrative error:', err.message);
+        }
+        const id = crypto.randomUUID();
+        stmts.insertMilestone.run(id, user.id, null, m.type, m.title, narrative, m.day);
+        newMilestones.push({ id, type: m.type, title: m.title, narrative, dayNumber: m.day });
+      }
+    }
+  }
+  return newMilestones;
+}
+
+// ── Plant health decay ─────────────────────────────────────────────
+// Call this on login or check-in to wither plants that haven't been checked in
+function decayPlantHealth(userId) {
+  const plants = stmts.getActivePlants.all(userId);
+  const now = Date.now();
+  for (const plant of plants) {
+    if (!plant.lastCheckIn) continue;
+    const lastCheck = new Date(plant.lastCheckIn).getTime();
+    const daysMissed = Math.floor((now - lastCheck) / 86400000) - 1; // -1 because today might not be done yet
+    if (daysMissed > 0) {
+      const decay = Math.min(daysMissed * 0.03, 0.3); // max 30% decay
+      const newHealth = Math.max(0, plant.health - decay);
+      if (newHealth !== plant.health) {
+        stmts.updatePlantHealth.run(newHealth, plant.growthStage, plant.id);
+      }
+    }
+  }
+}
+
+// ── Milestones endpoints ───────────────────────────────────────────
+app.get("/api/milestones", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const milestones = stmts.getMilestones.all(user.id);
+  res.json({ milestones });
+});
+
+app.post("/api/milestones/:id/share", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  stmts.markMilestoneShared.run(req.params.id);
+  res.json({ success: true });
+});
+
+// ── Share data endpoint ────────────────────────────────────────────
+app.get("/api/share/profile", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const plants = stmts.getActivePlants.all(user.id);
+  const milestones = stmts.getMilestones.all(user.id);
+  const gardenEntries = stmts.getGarden.all(user.id);
+  const journal = stmts.getJournal.all(user.id, 5);
+
+  res.json({
+    name: user.name,
+    streak: user.streak,
+    plants: plants.map(p => ({ species: p.species, name: p.name, color: p.color, health: p.health, growthStage: p.growthStage })),
+    milestones: milestones.map(m => ({ type: m.type, title: m.title, dayNumber: m.dayNumber, unlockedAt: m.unlockedAt })),
+    gardenSize: gardenEntries.length,
+    journalCount: journal.length,
+  });
+});
+
+// ── Plant color endpoint ───────────────────────────────────────────
+app.put("/api/plants/:id/color", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  stmts.updatePlantColor.run(req.body.color, req.params.id, user.id);
+  res.json({ success: true });
+});
+
+// ── Start server ────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`ALZO server running on port ${PORT}`);
   console.log(`ElevenLabs: ${ELEVENLABS_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`OpenAI: ${process.env.OPENAI_API_KEY ? 'enabled' : 'MISSING'}`);
+  console.log(`Endpoints: goals, checkin, mirror, plants, garden, journal, messages, milestones, share`);
 });

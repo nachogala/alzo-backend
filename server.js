@@ -109,8 +109,10 @@ db.exec(`
   );
 `);
 
-// Add color column if missing (migration for existing DBs)
+// Migrations for existing DBs
 try { db.exec("ALTER TABLE plants ADD COLUMN color TEXT DEFAULT '#6B4EFF'"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN notificationHour INTEGER DEFAULT 7"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN notificationMinute INTEGER DEFAULT 0"); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS milestones (

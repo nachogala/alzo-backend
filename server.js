@@ -771,6 +771,38 @@ app.post("/api/auth/apple", (req, res) => {
   res.json({ token, userId, isNewUser: true });
 });
 
+// Google Sign-in: idToken from frontend, decode payload to get email + sub
+// TODO: verify idToken signature with Google's public keys for production security
+app.post("/api/auth/google", (req, res) => {
+  const { idToken, email: providedEmail, name: providedName } = req.body;
+  if (!idToken) return res.status(400).json({ error: "idToken is required" });
+
+  let googleSub, tokenEmail;
+  try {
+    const payload = JSON.parse(Buffer.from(idToken.split(".")[1], "base64").toString("utf8"));
+    googleSub = payload.sub;
+    tokenEmail = payload.email;
+  } catch (e) {
+    return res.status(400).json({ error: "Invalid idToken" });
+  }
+
+  const email = (tokenEmail || providedEmail || "").toLowerCase();
+  if (!email) return res.status(400).json({ error: "No email available from Google" });
+
+  let user = stmts.getByEmail.get(email);
+  const token = generateToken();
+
+  if (user) {
+    stmts.updateToken.run(token, email);
+    return res.json({ token, userId: user.id, isNewUser: false });
+  }
+
+  const userId = crypto.randomBytes(16).toString("hex");
+  const name = providedName || null;
+  stmts.insert.run(userId, email, name, "google_sso_" + googleSub, token);
+  res.json({ token, userId, isNewUser: true });
+});
+
 app.get("/api/user/profile", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });

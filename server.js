@@ -740,6 +740,37 @@ app.post("/api/auth/login", (req, res) => {
   res.json({ token, userId: user.id });
 });
 
+// Apple Sign-in: identityToken from frontend, decode to get email + sub (apple user id)
+app.post("/api/auth/apple", (req, res) => {
+  const { identityToken, email: providedEmail, fullName } = req.body;
+  if (!identityToken) return res.status(400).json({ error: "identityToken is required" });
+
+  let appleSub, tokenEmail;
+  try {
+    const payload = JSON.parse(Buffer.from(identityToken.split(".")[1], "base64").toString("utf8"));
+    appleSub = payload.sub;
+    tokenEmail = payload.email;
+  } catch (e) {
+    return res.status(400).json({ error: "Invalid identityToken" });
+  }
+
+  const email = (tokenEmail || providedEmail || "").toLowerCase();
+  if (!email) return res.status(400).json({ error: "No email available from Apple" });
+
+  let user = stmts.getByEmail.get(email);
+  const token = generateToken();
+
+  if (user) {
+    stmts.updateToken.run(token, email);
+    return res.json({ token, userId: user.id });
+  }
+
+  const userId = crypto.randomBytes(16).toString("hex");
+  const name = fullName || null;
+  stmts.insert.run(userId, email, name, "apple_sso_" + appleSub, token);
+  res.json({ token, userId });
+});
+
 app.get("/api/user/profile", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });

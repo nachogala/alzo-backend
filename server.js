@@ -762,13 +762,13 @@ app.post("/api/auth/apple", (req, res) => {
 
   if (user) {
     stmts.updateToken.run(token, email);
-    return res.json({ token, userId: user.id });
+    return res.json({ token, userId: user.id, isNewUser: false });
   }
 
   const userId = crypto.randomBytes(16).toString("hex");
   const name = fullName || null;
   stmts.insert.run(userId, email, name, "apple_sso_" + appleSub, token);
-  res.json({ token, userId });
+  res.json({ token, userId, isNewUser: true });
 });
 
 app.get("/api/user/profile", (req, res) => {

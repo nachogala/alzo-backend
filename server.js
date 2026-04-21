@@ -4,6 +4,7 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const OpenAI = require("openai");
+const Stripe = require("stripe");
 
 const crypto = require("crypto");
 const Database = require("better-sqlite3");
@@ -114,6 +115,11 @@ try { db.exec("ALTER TABLE plants ADD COLUMN color TEXT DEFAULT '#6B4EFF'"); } c
 try { db.exec("ALTER TABLE users ADD COLUMN notificationHour INTEGER DEFAULT 7"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN notificationMinute INTEGER DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN elevenlabsVoiceId TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN stripeCustomerId TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN stripeSubscriptionId TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN subscriptionStatus TEXT DEFAULT 'none'"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN subscriptionCurrentPeriodEnd INTEGER"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN trialEndsAt INTEGER"); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS affirmations (
@@ -172,6 +178,11 @@ const stmts = {
   getAffirmationByDate: db.prepare("SELECT * FROM affirmations WHERE userId = ? AND dateKey = ?"),
   insertAffirmation: db.prepare("INSERT INTO affirmations (id, userId, dateKey, text, audioUrl, voiceMode) VALUES (?, ?, ?, ?, ?, ?)"),
   countUsers: db.prepare("SELECT COUNT(*) AS n FROM users"),
+  setStripeCustomer: db.prepare("UPDATE users SET stripeCustomerId = ? WHERE id = ?"),
+  setSubscription: db.prepare("UPDATE users SET stripeSubscriptionId = ?, subscriptionStatus = ?, subscriptionCurrentPeriodEnd = ? WHERE id = ?"),
+  setSubscriptionByCustomerId: db.prepare("UPDATE users SET stripeSubscriptionId = ?, subscriptionStatus = ?, subscriptionCurrentPeriodEnd = ? WHERE stripeCustomerId = ?"),
+  setTrial: db.prepare("UPDATE users SET trialEndsAt = ? WHERE id = ?"),
+  getUserByStripeCustomer: db.prepare("SELECT * FROM users WHERE stripeCustomerId = ?"),
   deleteUser: db.prepare("DELETE FROM users WHERE email = ?"),
   // Goals
   insertGoal: db.prepare("INSERT INTO goals (id, userId, type, description, audioUrl, motivation, motivationAudioUrl, horizonDays, targetDate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
@@ -228,7 +239,13 @@ fs.mkdirSync(path.join(__dirname, "uploads"), { recursive: true });
 fs.mkdirSync(path.join(__dirname, "public", "audio"), { recursive: true });
 
 // Middleware
-app.use(express.json({ limit: "50mb" }));
+// Stripe webhook requires the raw body to verify the signature. Keep it
+// un-parsed by the global JSON middleware and let the webhook route handle
+// its own express.raw() parsing below.
+app.use((req, res, next) => {
+  if (req.originalUrl === "/api/stripe/webhook") return next();
+  return express.json({ limit: "50mb" })(req, res, next);
+});
 app.use(express.static("public"));
 
 // Multer for voice uploads
@@ -246,6 +263,13 @@ const upload = multer({
 
 // OpenAI client
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-12-18.acacia" })
+  : null;
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || "";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS || "7", 10);
+const APP_URL = process.env.APP_URL || "https://alzo.thenetmencorp.com";
 
 // ElevenLabs config
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
@@ -760,6 +784,19 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
     const user = getUserByToken(req);
     if (!user) return res.status(401).json({ error: "Unauthorized" });
 
+    // Paywall gate: active subscription OR within trial. Otherwise 402 with
+    // a hint for the app to open checkout.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const subActive = ["active", "trialing", "past_due"].includes(user.subscriptionStatus || "");
+    const inTrial = user.trialEndsAt && nowSec < user.trialEndsAt;
+    if (!subActive && !inTrial) {
+      return res.status(402).json({
+        error: "Subscription required",
+        message: "Your free trial ended. Subscribe to keep getting daily affirmations.",
+        checkoutPath: "/api/stripe/create-checkout-session",
+      });
+    }
+
     const { context, language, detectedGender, timezoneOffsetMinutes } = req.body || {};
     // dateKey = the user's local date, so cron behavior is timezone-friendly.
     // timezoneOffsetMinutes: JS Date.getTimezoneOffset() value (UTC-local in minutes).
@@ -847,6 +884,143 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
   }
 });
 
+// ── Stripe endpoints ───────────────────────────────────────────────
+// POST /api/stripe/create-checkout-session
+// Authenticated. Creates or reuses a Stripe customer, opens a Checkout session
+// for STRIPE_PRICE_ID (the Monthly plan), returns the hosted URL.
+app.post("/api/stripe/create-checkout-session", express.json(), async (req, res) => {
+  try {
+    if (!stripe || !STRIPE_PRICE_ID) {
+      return res.status(503).json({ error: "Stripe not configured" });
+    }
+    const user = getUserByToken(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+    let customerId = user.stripeCustomerId;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: user.name || undefined,
+        metadata: { alzoUserId: user.id },
+      });
+      customerId = customer.id;
+      stmts.setStripeCustomer.run(customerId, user.id);
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
+      subscription_data: {
+        trial_period_days: TRIAL_DAYS,
+        metadata: { alzoUserId: user.id },
+      },
+      success_url: `${APP_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${APP_URL}/subscription/cancel`,
+      allow_promotion_codes: true,
+      metadata: { alzoUserId: user.id },
+    });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (err) {
+    console.error("create-checkout-session error:", err.message);
+    res.status(500).json({ error: "Failed to create checkout session" });
+  }
+});
+
+// POST /api/stripe/webhook
+// Stripe signs the webhook body — we verify via STRIPE_WEBHOOK_SECRET, then
+// react to subscription lifecycle events.
+//
+// Important: Stripe needs the RAW body (not the JSON-parsed one) to verify the
+// signature. Using express.raw({ type: 'application/json' }) for this route
+// only. Must be registered BEFORE the catch-all express.json() middleware that
+// lives above.
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+      return res.status(503).send("Stripe webhook not configured");
+    }
+    const sig = req.headers["stripe-signature"];
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.error("Stripe webhook signature failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      switch (event.type) {
+        case "checkout.session.completed": {
+          const session = event.data.object;
+          const customerId = session.customer;
+          const subscriptionId = session.subscription;
+          if (subscriptionId && customerId) {
+            const sub = await stripe.subscriptions.retrieve(subscriptionId);
+            stmts.setSubscriptionByCustomerId.run(
+              subscriptionId,
+              sub.status,
+              sub.current_period_end,
+              customerId,
+            );
+          }
+          break;
+        }
+        case "customer.subscription.updated":
+        case "customer.subscription.created": {
+          const sub = event.data.object;
+          stmts.setSubscriptionByCustomerId.run(
+            sub.id,
+            sub.status,
+            sub.current_period_end,
+            sub.customer,
+          );
+          break;
+        }
+        case "customer.subscription.deleted": {
+          const sub = event.data.object;
+          stmts.setSubscriptionByCustomerId.run(
+            sub.id,
+            "canceled",
+            sub.current_period_end,
+            sub.customer,
+          );
+          break;
+        }
+      }
+      res.json({ received: true });
+    } catch (err) {
+      console.error("Stripe webhook handler error:", err.message);
+      res.status(500).send("Webhook handler error");
+    }
+  }
+);
+
+// GET /api/subscription/status — authenticated. Returns whether the user has
+// access (active, trialing, or within trialEndsAt).
+app.get("/api/subscription/status", (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const now = Math.floor(Date.now() / 1000);
+  const status = user.subscriptionStatus || "none";
+  const inTrial = user.trialEndsAt && now < user.trialEndsAt;
+  const subActive = ["active", "trialing", "past_due"].includes(status);
+  const hasAccess = subActive || inTrial;
+
+  res.json({
+    hasAccess,
+    status,
+    inTrial: !!inTrial,
+    trialEndsAt: user.trialEndsAt || null,
+    subscriptionCurrentPeriodEnd: user.subscriptionCurrentPeriodEnd || null,
+  });
+});
+
 // ── Auth endpoints ──────────────────────────────────────────────────
 app.post("/api/auth/signup", (req, res) => {
   const { email, password, name } = req.body;
@@ -871,7 +1045,11 @@ app.post("/api/auth/signup", (req, res) => {
   const token = generateToken();
   stmts.insert.run(userId, email.toLowerCase(), name || null, hashPassword(password), token);
 
-  res.json({ token, userId });
+  // Grant free trial so the user can use the app for TRIAL_DAYS before paywall kicks in.
+  const trialEndsAt = Math.floor(Date.now() / 1000) + TRIAL_DAYS * 86400;
+  stmts.setTrial.run(trialEndsAt, userId);
+
+  res.json({ token, userId, trialEndsAt });
 });
 
 app.post("/api/auth/reset-password", (req, res) => {

@@ -116,6 +116,20 @@ try { db.exec("ALTER TABLE users ADD COLUMN notificationMinute INTEGER DEFAULT 0
 try { db.exec("ALTER TABLE users ADD COLUMN elevenlabsVoiceId TEXT"); } catch {}
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS affirmations (
+    id TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    dateKey TEXT NOT NULL,
+    text TEXT,
+    audioUrl TEXT,
+    voiceMode TEXT,
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(userId, dateKey),
+    FOREIGN KEY (userId) REFERENCES users(id)
+  )
+`);
+
+db.exec(`
   CREATE TABLE IF NOT EXISTS milestones (
     id TEXT PRIMARY KEY,
     userId TEXT NOT NULL,
@@ -155,6 +169,9 @@ const stmts = {
   updateNotification: db.prepare("UPDATE users SET notificationHour = ?, notificationMinute = ? WHERE id = ?"),
   getVoiceId: db.prepare("SELECT elevenlabsVoiceId FROM users WHERE id = ?"),
   setVoiceId: db.prepare("UPDATE users SET elevenlabsVoiceId = ? WHERE id = ?"),
+  getAffirmationByDate: db.prepare("SELECT * FROM affirmations WHERE userId = ? AND dateKey = ?"),
+  insertAffirmation: db.prepare("INSERT INTO affirmations (id, userId, dateKey, text, audioUrl, voiceMode) VALUES (?, ?, ?, ?, ?, ?)"),
+  countUsers: db.prepare("SELECT COUNT(*) AS n FROM users"),
   deleteUser: db.prepare("DELETE FROM users WHERE email = ?"),
   // Goals
   insertGoal: db.prepare("INSERT INTO goals (id, userId, type, description, audioUrl, motivation, motivationAudioUrl, horizonDays, targetDate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
@@ -733,6 +750,103 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
   }
 });
 
+// ── Daily affirmation (lazy generation, one per user per day) ───────
+// App hits this when opening the home screen. If the user already has today's
+// affirmation, return it instantly. Otherwise generate it on-demand using the
+// cached voice_id (fast path, ~3s) and store it so the rest of the day the
+// call is free (DB cache hit).
+app.post("/api/affirmation/today", express.json(), async (req, res) => {
+  try {
+    const user = getUserByToken(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+    const { context, language, detectedGender, timezoneOffsetMinutes } = req.body || {};
+    // dateKey = the user's local date, so cron behavior is timezone-friendly.
+    // timezoneOffsetMinutes: JS Date.getTimezoneOffset() value (UTC-local in minutes).
+    // e.g. NYC EDT = 240 (positive means behind UTC). Normalize to user local midnight.
+    const tz = Number.isFinite(timezoneOffsetMinutes) ? timezoneOffsetMinutes : 0;
+    const local = new Date(Date.now() - tz * 60 * 1000);
+    const dateKey = local.toISOString().slice(0, 10); // YYYY-MM-DD in user-local time
+
+    const cached = stmts.getAffirmationByDate.get(user.id, dateKey);
+    if (cached) {
+      return res.json({
+        dateKey,
+        affirmationText: cached.text,
+        audioUrl: cached.audioUrl,
+        voiceMode: cached.voiceMode,
+        cached: true,
+      });
+    }
+
+    if (!context) {
+      return res.status(400).json({ error: "Context is required for first-of-day generation" });
+    }
+
+    // Generate text
+    const affirmationText = await generateAffirmation(context, language);
+
+    // Generate audio — prefer cached voice_id, fall back to clone, fall back to preset
+    let audioUrl = null;
+    let voiceMode = "preset";
+    const cachedRow = stmts.getVoiceId.get(user.id);
+    const cachedVoiceId = cachedRow?.elevenlabsVoiceId || null;
+
+    // Find user's voice sample by any stored sessionId pattern (uploads dir)
+    const uploadsDir = path.join(__dirname, "uploads");
+    const userVoiceCandidates = fs.readdirSync(uploadsDir)
+      .filter((f) => /^voice_\d+\.(m4a|webm)$/.test(f))
+      .sort()
+      .reverse();
+    const voicePath = userVoiceCandidates.length ? path.join(uploadsDir, userVoiceCandidates[0]) : null;
+
+    if (ELEVENLABS_API_KEY && (cachedVoiceId || voicePath)) {
+      const cloneResult = await cloneVoiceAndSpeak(
+        affirmationText,
+        voicePath,
+        detectedGender,
+        language,
+        cachedVoiceId,
+      );
+      audioUrl = cloneResult.audioUrl;
+      voiceMode = cloneResult.voiceDebug.cloneMode || "unknown";
+      if (cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
+        stmts.setVoiceId.run(cloneResult.voiceId, user.id);
+      }
+    }
+
+    if (!audioUrl) {
+      const fallback = await textToSpeechFallback(affirmationText, detectedGender, language);
+      audioUrl = fallback.audioUrl;
+      voiceMode = fallback.voiceDebug.cloneMode || "preset";
+    }
+
+    const id = crypto.randomBytes(12).toString("hex");
+    try {
+      stmts.insertAffirmation.run(id, user.id, dateKey, affirmationText, audioUrl, voiceMode);
+    } catch (e) {
+      // If two concurrent requests both generated, the UNIQUE(userId, dateKey) will
+      // reject one. Return the now-stored row in that case.
+      const row = stmts.getAffirmationByDate.get(user.id, dateKey);
+      if (row) {
+        return res.json({
+          dateKey,
+          affirmationText: row.text,
+          audioUrl: row.audioUrl,
+          voiceMode: row.voiceMode,
+          cached: true,
+        });
+      }
+      throw e;
+    }
+
+    res.json({ dateKey, affirmationText, audioUrl, voiceMode, cached: false });
+  } catch (err) {
+    console.error("affirmation/today error:", err);
+    res.status(500).json({ error: "Failed to generate today's affirmation" });
+  }
+});
+
 // ── Auth endpoints ──────────────────────────────────────────────────
 app.post("/api/auth/signup", (req, res) => {
   const { email, password, name } = req.body;
@@ -741,6 +855,17 @@ app.post("/api/auth/signup", (req, res) => {
 
   const existing = stmts.getByEmail.get(email.toLowerCase());
   if (existing) return res.status(409).json({ error: "Account already exists" });
+
+  // MVP user cap. Raise BETA_USER_CAP env var to open the gate.
+  const USER_CAP = parseInt(process.env.BETA_USER_CAP || "1000", 10);
+  const current = stmts.countUsers.get().n;
+  if (current >= USER_CAP) {
+    return res.status(503).json({
+      error: "Beta full",
+      message: "ALZO beta is full. Join the waitlist and we'll reach out as slots open.",
+      waitlistUrl: "https://thenetmencorp.com/alzo-waitlist",
+    });
+  }
 
   const userId = crypto.randomBytes(16).toString("hex");
   const token = generateToken();

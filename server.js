@@ -113,6 +113,7 @@ db.exec(`
 try { db.exec("ALTER TABLE plants ADD COLUMN color TEXT DEFAULT '#6B4EFF'"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN notificationHour INTEGER DEFAULT 7"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN notificationMinute INTEGER DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN elevenlabsVoiceId TEXT"); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS milestones (
@@ -152,6 +153,8 @@ const stmts = {
   updateToken: db.prepare("UPDATE users SET token = ? WHERE email = ?"),
   updatePlan: db.prepare("UPDATE users SET plan = ? WHERE email = ?"),
   updateNotification: db.prepare("UPDATE users SET notificationHour = ?, notificationMinute = ? WHERE id = ?"),
+  getVoiceId: db.prepare("SELECT elevenlabsVoiceId FROM users WHERE id = ?"),
+  setVoiceId: db.prepare("UPDATE users SET elevenlabsVoiceId = ? WHERE id = ?"),
   deleteUser: db.prepare("DELETE FROM users WHERE email = ?"),
   // Goals
   insertGoal: db.prepare("INSERT INTO goals (id, userId, type, description, audioUrl, motivation, motivationAudioUrl, horizonDays, targetDate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
@@ -344,7 +347,7 @@ function withTimeout(promise, ms) {
   ]);
 }
 
-async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language) {
+async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existingVoiceId = null) {
   const debug = {
     cloneMode: 'not_attempted',
     sampleCount: Array.isArray(voiceFilePath) ? voiceFilePath.length : (voiceFilePath ? 1 : 0),
@@ -360,7 +363,31 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language) {
   if (!ELEVENLABS_API_KEY) {
     debug.cloneMode = 'disabled';
     debug.error = 'ELEVENLABS_API_KEY missing';
-    return { audioUrl: null, voiceDebug: debug };
+    return { audioUrl: null, voiceDebug: debug, voiceId: null };
+  }
+
+  // Fast path: user already has a cached voice_id → skip the clone (25s → 3s)
+  if (existingVoiceId) {
+    debug.customVoiceId = existingVoiceId;
+    debug.playbackVoiceId = existingVoiceId;
+    debug.cloneMode = 'reused';
+    try {
+      const speech = await withTimeout(generateSpeech(text, existingVoiceId, language), 30000);
+      if (!speech || !speech.audioUrl) {
+        debug.cloneMode = 'tts_failed_on_reuse';
+        debug.error = 'speech generation failed with cached voice_id';
+        debug.fallbackBlocked = true;
+        return { audioUrl: null, voiceDebug: debug, voiceId: existingVoiceId };
+      }
+      debug.modelId = speech.modelId;
+      return { audioUrl: speech.audioUrl, voiceDebug: debug, voiceId: existingVoiceId };
+    } catch (err) {
+      console.error('TTS with cached voice failed:', err.message);
+      debug.cloneMode = 'tts_error_on_reuse';
+      debug.error = err.message;
+      debug.fallbackBlocked = true;
+      return { audioUrl: null, voiceDebug: debug, voiceId: existingVoiceId };
+    }
   }
 
   try {
@@ -392,7 +419,7 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language) {
       debug.cloneMode = 'clone_failed';
       debug.error = errorText;
       debug.fallbackBlocked = true;
-      return { audioUrl: null, voiceDebug: debug };
+      return { audioUrl: null, voiceDebug: debug, voiceId: null };
     }
 
     const { voice_id } = await addVoiceRes.json();
@@ -402,26 +429,24 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language) {
 
     const speech = await withTimeout(generateSpeech(text, voice_id, language), 30000);
     if (!speech || !speech.audioUrl) {
+      // Clone succeeded but TTS failed — clean up the orphan voice
       fetch(`${ELEVENLABS_BASE}/voices/${voice_id}`, { method: 'DELETE', headers: { 'xi-api-key': ELEVENLABS_API_KEY } }).catch(() => {});
       debug.cloneMode = 'tts_failed_after_clone';
       debug.error = 'speech generation failed after clone';
       debug.fallbackBlocked = true;
-      return { audioUrl: null, voiceDebug: debug };
+      return { audioUrl: null, voiceDebug: debug, voiceId: null };
     }
 
     debug.modelId = speech.modelId;
-    fetch(`${ELEVENLABS_BASE}/voices/${voice_id}`, {
-      method: "DELETE",
-      headers: { "xi-api-key": ELEVENLABS_API_KEY },
-    }).catch(() => {});
-
-    return { audioUrl: speech.audioUrl, voiceDebug: debug };
+    // PERSIST the cloned voice so daily affirmations can reuse it. Caller must
+    // save voiceId to the user row in DB so next call hits the reuse fast path.
+    return { audioUrl: speech.audioUrl, voiceDebug: debug, voiceId: voice_id };
   } catch (err) {
     console.error("ElevenLabs clone error:", err.message);
     debug.cloneMode = 'clone_error';
     debug.error = err.message;
     debug.fallbackBlocked = true;
-    return { audioUrl: null, voiceDebug: debug };
+    return { audioUrl: null, voiceDebug: debug, voiceId: null };
   }
 }
 
@@ -671,7 +696,14 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     const voicePath = fs.existsSync(voicePathM4a) ? voicePathM4a : (fs.existsSync(voicePathWebm) ? voicePathWebm : null);
 
     if (sessionId && voicePath) {
-      // Try to use manifest (all samples) for better clone
+      // Check for a cached ElevenLabs voice_id on the authenticated user.
+      // Daily affirmations reuse the cached voice — no re-clone, 1/10th the cost
+      // and latency (~3s vs ~25s).
+      const authedUser = getUserByToken(req);
+      const cachedRow = authedUser ? stmts.getVoiceId.get(authedUser.id) : null;
+      const cachedVoiceId = cachedRow?.elevenlabsVoiceId || null;
+
+      // Try to use manifest (all samples) for better clone if no cache yet
       let voiceArg = voicePath;
       if (fs.existsSync(manifestPath)) {
         try {
@@ -680,9 +712,13 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
         } catch {}
         // Keep manifest so subsequent daily affirmations can reuse samples
       }
-      const cloneResult = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language);
+      const cloneResult = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language, cachedVoiceId);
       audioUrl = cloneResult.audioUrl;
       voiceDebug = cloneResult.voiceDebug;
+      // Persist the new voice_id so the next affirmation skips the clone step.
+      if (authedUser && cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
+        stmts.setVoiceId.run(cloneResult.voiceId, authedUser.id);
+      }
       // Do NOT delete voicePath — daily affirmations need the same sample.
     } else {
       const fallbackResult = await textToSpeechFallback(affirmationText, gender, language);

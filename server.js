@@ -678,12 +678,12 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
           const files = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).filter(f => fs.existsSync(f));
           if (files.length > 1) voiceArg = files;
         } catch {}
-        fs.unlink(manifestPath, () => {});
+        // Keep manifest so subsequent daily affirmations can reuse samples
       }
       const cloneResult = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language);
       audioUrl = cloneResult.audioUrl;
       voiceDebug = cloneResult.voiceDebug;
-      fs.unlink(voicePath, () => {});
+      // Do NOT delete voicePath — daily affirmations need the same sample.
     } else {
       const fallbackResult = await textToSpeechFallback(affirmationText, gender, language);
       audioUrl = fallbackResult.audioUrl;

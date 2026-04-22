@@ -1,4 +1,12 @@
 require("dotenv").config();
+const Sentry = require("@sentry/node");
+Sentry.init({
+  dsn: process.env.SENTRY_DSN || "",
+  enabled: !!process.env.SENTRY_DSN,
+  environment: process.env.NODE_ENV || "production",
+  serverName: "alzo-backend",
+  tracesSampleRate: 0.1,
+});
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
@@ -1573,10 +1581,14 @@ app.put("/api/plants/:id/color", (req, res) => {
   res.json({ success: true });
 });
 
+// Sentry error handler — must be registered after all routes.
+Sentry.setupExpressErrorHandler(app);
+
 // ── Start server ────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`ALZO server running on port ${PORT}`);
   console.log(`ElevenLabs: ${ELEVENLABS_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`OpenAI: ${process.env.OPENAI_API_KEY ? 'enabled' : 'MISSING'}`);
+  console.log(`Sentry: ${process.env.SENTRY_DSN ? 'enabled' : 'disabled'}`);
   console.log(`Endpoints: goals, checkin, mirror, plants, garden, journal, messages, milestones, share`);
 });

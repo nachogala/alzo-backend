@@ -8,6 +8,8 @@ const Stripe = require("stripe");
 
 const crypto = require("crypto");
 const Database = require("better-sqlite3");
+const { OAuth2Client } = require("google-auth-library");
+const appleSignin = require("apple-signin-auth");
 
 const app = express();
 const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
@@ -263,6 +265,9 @@ const upload = multer({
 
 // OpenAI client
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID || "";
+const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "com.alzo.app";
+const googleAuthClient = GOOGLE_WEB_CLIENT_ID ? new OAuth2Client(GOOGLE_WEB_CLIENT_ID) : null;
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-12-18.acacia" })
   : null;
@@ -1079,18 +1084,22 @@ app.post("/api/auth/login", (req, res) => {
   res.json({ token, userId: user.id });
 });
 
-// Apple Sign-in: identityToken from frontend, decode to get email + sub (apple user id)
-app.post("/api/auth/apple", (req, res) => {
+// Apple Sign-in: identityToken from frontend, verify signature against Apple JWKS
+app.post("/api/auth/apple", async (req, res) => {
   const { identityToken, email: providedEmail, fullName } = req.body;
   if (!identityToken) return res.status(400).json({ error: "identityToken is required" });
 
   let appleSub, tokenEmail;
   try {
-    const payload = JSON.parse(Buffer.from(identityToken.split(".")[1], "base64").toString("utf8"));
+    const payload = await appleSignin.verifyIdToken(identityToken, {
+      audience: APPLE_BUNDLE_ID,
+      ignoreExpiration: false,
+    });
     appleSub = payload.sub;
     tokenEmail = payload.email;
   } catch (e) {
-    return res.status(400).json({ error: "Invalid identityToken" });
+    console.error("Apple token verification failed:", e.message);
+    return res.status(401).json({ error: "Authentication failed" });
   }
 
   const email = (tokenEmail || providedEmail || "").toLowerCase();
@@ -1110,19 +1119,27 @@ app.post("/api/auth/apple", (req, res) => {
   res.json({ token, userId, isNewUser: true });
 });
 
-// Google Sign-in: idToken from frontend, decode payload to get email + sub
-// TODO: verify idToken signature with Google's public keys for production security
-app.post("/api/auth/google", (req, res) => {
+// Google Sign-in: idToken from frontend, verify signature against Google JWKS
+app.post("/api/auth/google", async (req, res) => {
   const { idToken, email: providedEmail, name: providedName } = req.body;
   if (!idToken) return res.status(400).json({ error: "idToken is required" });
+  if (!googleAuthClient) {
+    console.error("Google auth misconfigured: GOOGLE_WEB_CLIENT_ID missing");
+    return res.status(500).json({ error: "Server misconfigured" });
+  }
 
   let googleSub, tokenEmail;
   try {
-    const payload = JSON.parse(Buffer.from(idToken.split(".")[1], "base64").toString("utf8"));
+    const ticket = await googleAuthClient.verifyIdToken({
+      idToken,
+      audience: GOOGLE_WEB_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
     googleSub = payload.sub;
     tokenEmail = payload.email;
   } catch (e) {
-    return res.status(400).json({ error: "Invalid idToken" });
+    console.error("Google token verification failed:", e.message);
+    return res.status(401).json({ error: "Authentication failed" });
   }
 
   const email = (tokenEmail || providedEmail || "").toLowerCase();

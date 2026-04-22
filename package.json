@@ -9,9 +9,11 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
+    "apple-signin-auth": "^2.0.0",
     "better-sqlite3": "^12.8.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "google-auth-library": "^10.6.2",
     "multer": "^1.4.5-lts.1",
     "openai": "^4.78.0",
     "stripe": "^22.0.2"

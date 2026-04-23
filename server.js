@@ -1582,10 +1582,6 @@ app.put("/api/plants/:id/color", (req, res) => {
 });
 
 
-// ── Temporary: Sentry pipeline test endpoint (remove after validation) ──
-app.get("/api/test-sentry-error", (req, res) => {
-  throw new Error("Sentry integration test - Build 46 prep - 2026-04-22");
-});
 
 
 // Sentry error handler — must be registered after all routes.

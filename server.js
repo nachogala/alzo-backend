@@ -175,6 +175,31 @@ db.exec(`
   );
 `);
 
+// ── B48-4 migration: sanitize stale horizonDays values ────────────────
+// Joaquín reported a goal showing 17 days on Home. Investigation showed FE
+// reads `durationDays`/`goalDaysRemaining` and any non-(7,90) horizonDays in
+// the DB will leak through both fields. Reset any stale rows so the type
+// implies the duration: 'short' → 7, 'long' (or anything else) → 90.
+// Idempotent: safe to re-run on every boot.
+try {
+  const stale = db.prepare(
+    "SELECT id, type, horizonDays FROM goals WHERE horizonDays NOT IN (7, 90)"
+  ).all();
+  if (stale.length > 0) {
+    console.log(`[migration B48-4] sanitizing ${stale.length} stale goal(s)`);
+    const upd = db.prepare("UPDATE goals SET horizonDays = ? WHERE id = ?");
+    const txn = db.transaction((rows) => {
+      for (const r of rows) {
+        const fixed = r.type === 'short' ? 7 : 90;
+        upd.run(fixed, r.id);
+      }
+    });
+    txn(stale);
+  }
+} catch (e) {
+  console.error('[migration B48-4] failed:', e.message);
+}
+
 // Prepared statements
 const stmts = {
   getByEmail: db.prepare("SELECT * FROM users WHERE email = ?"),
@@ -1293,7 +1318,10 @@ app.post("/api/goals", (req, res) => {
 app.get("/api/goals", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  const goals = stmts.getActiveGoals.all(user.id);
+  const rows = stmts.getActiveGoals.all(user.id);
+  // B48-4: FE reads `durationDays` per HomeScreen.js:121 but DB column is
+  // `horizonDays`. Send both — FE-side rename can land later without a BE bump.
+  const goals = rows.map((g) => ({ ...g, durationDays: g.horizonDays }));
   res.json({ goals });
 });
 
@@ -1426,6 +1454,10 @@ app.get("/api/mirror", (req, res) => {
     daysActive: totalCheckins,
     goalDaysRemaining: primaryGoal ? Math.max(0, Math.ceil((new Date(primaryGoal.targetDate) - Date.now()) / 86400000)) : null,
     goalProgress: primaryGoal ? Math.round(((primaryGoal.horizonDays - Math.max(0, Math.ceil((new Date(primaryGoal.targetDate) - Date.now()) / 86400000))) / primaryGoal.horizonDays) * 100) : 0,
+    // B48-4: explicit duration so FE can render "X days" without computing
+    // remaining-days from a stale targetDate. Both names exposed for compat.
+    goalHorizonDays: primaryGoal?.horizonDays ?? null,
+    goalDurationDays: primaryGoal?.horizonDays ?? null,
   });
 });
 

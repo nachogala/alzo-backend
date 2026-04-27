@@ -431,6 +431,17 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
         debug.cloneMode = 'tts_failed_on_reuse';
         debug.error = 'speech generation failed with cached voice_id';
         debug.fallbackBlocked = true;
+        Sentry.addBreadcrumb({
+          category: 'elevenlabs.clone',
+          level: 'error',
+          message: 'tts_failed_on_reuse',
+          data: { voiceId: existingVoiceId, language },
+        });
+        Sentry.captureMessage('elevenlabs.tts_failed_on_reuse', {
+          level: 'warning',
+          tags: { component: 'elevenlabs', cloneMode: 'tts_failed_on_reuse' },
+          extra: { voiceId: existingVoiceId, language },
+        });
         return { audioUrl: null, voiceDebug: debug, voiceId: existingVoiceId };
       }
       debug.modelId = speech.modelId;
@@ -440,6 +451,21 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
       debug.cloneMode = 'tts_error_on_reuse';
       debug.error = err.message;
       debug.fallbackBlocked = true;
+      Sentry.addBreadcrumb({
+        category: 'elevenlabs.clone',
+        level: 'error',
+        message: 'tts_error_on_reuse',
+        data: {
+          voiceId: existingVoiceId,
+          language,
+          status: err.status,
+          body: err.body ? String(err.body).slice(0, 500) : undefined,
+        },
+      });
+      Sentry.captureException(err, {
+        tags: { component: 'elevenlabs', cloneMode: 'tts_error_on_reuse' },
+        extra: { voiceId: existingVoiceId, language },
+      });
       return { audioUrl: null, voiceDebug: debug, voiceId: existingVoiceId };
     }
   }
@@ -448,6 +474,9 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
     const formData = new FormData();
     formData.append("name", `alzo_${Date.now()}`);
     formData.append("description", "ALZO user voice clone for affirmations");
+    // B48-3: clean up sample audio before fingerprinting — kicks clone quality
+    // up materially when source has room tone, breath, fan noise, etc.
+    formData.append("remove_background_noise", "true");
     if (Array.isArray(voiceFilePath)) {
       voiceFilePath.forEach((fp, i) => {
         const buf = fs.readFileSync(fp);
@@ -473,6 +502,17 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
       debug.cloneMode = 'clone_failed';
       debug.error = errorText;
       debug.fallbackBlocked = true;
+      Sentry.addBreadcrumb({
+        category: 'elevenlabs.clone',
+        level: 'error',
+        message: 'clone_failed',
+        data: { status: addVoiceRes ? addVoiceRes.status : 'timeout', body: String(errorText).slice(0, 500) },
+      });
+      Sentry.captureMessage('elevenlabs.clone_failed', {
+        level: 'warning',
+        tags: { component: 'elevenlabs', cloneMode: 'clone_failed' },
+        extra: { errorBody: String(errorText).slice(0, 500) },
+      });
       return { audioUrl: null, voiceDebug: debug, voiceId: null };
     }
 
@@ -488,6 +528,17 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
       debug.cloneMode = 'tts_failed_after_clone';
       debug.error = 'speech generation failed after clone';
       debug.fallbackBlocked = true;
+      Sentry.addBreadcrumb({
+        category: 'elevenlabs.clone',
+        level: 'error',
+        message: 'tts_failed_after_clone',
+        data: { voiceId: voice_id, language },
+      });
+      Sentry.captureMessage('elevenlabs.tts_failed_after_clone', {
+        level: 'warning',
+        tags: { component: 'elevenlabs', cloneMode: 'tts_failed_after_clone' },
+        extra: { voiceId: voice_id, language },
+      });
       return { audioUrl: null, voiceDebug: debug, voiceId: null };
     }
 
@@ -548,9 +599,10 @@ async function textToSpeechFallback(text, gender, language) {
 }
 
 async function generateSpeech(text, voiceId, language) {
-  // Use turbo for English (faster), multilingual v2 for other languages
-  const isEnglish = !language || language.startsWith('en');
-  const model = isEnglish ? 'eleven_turbo_v2_5' : 'eleven_multilingual_v2';
+  // B48-3: always use multilingual_v2 — turbo_v2_5 trades quality for latency,
+  // wrong tradeoff for one-daily-affirmation use case. Quality > 200ms latency.
+  // B48-8: capture full provider response body on failure so Sentry shows root cause.
+  const model = 'eleven_multilingual_v2';
   const ttsRes = await fetch(
     `${ELEVENLABS_BASE}/text-to-speech/${voiceId}`,
     {
@@ -562,13 +614,29 @@ async function generateSpeech(text, voiceId, language) {
       body: JSON.stringify({
         text,
         model_id: model,
-        voice_settings: { stability: 0.55, similarity_boost: 0.80 },
+        // ElevenLabs-recommended IVC profile for emotive content (B48-3).
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.85,
+          style: 0.15,
+          use_speaker_boost: true,
+        },
       }),
     }
   );
 
   if (!ttsRes.ok) {
-    throw new Error(`TTS failed: ${await ttsRes.text()}`);
+    const body = await ttsRes.text();
+    Sentry.addBreadcrumb({
+      category: 'elevenlabs.tts',
+      level: 'error',
+      message: 'TTS request failed',
+      data: { status: ttsRes.status, voiceId, model, language, body: body.slice(0, 500) },
+    });
+    const err = new Error(`TTS failed: ${ttsRes.status} ${body}`);
+    err.status = ttsRes.status;
+    err.body = body;
+    throw err;
   }
 
   const audioBuffer = Buffer.from(await ttsRes.arrayBuffer());

@@ -219,6 +219,19 @@ const stmts = {
   setTrial: db.prepare("UPDATE users SET trialEndsAt = ? WHERE id = ?"),
   getUserByStripeCustomer: db.prepare("SELECT * FROM users WHERE stripeCustomerId = ?"),
   deleteUser: db.prepare("DELETE FROM users WHERE email = ?"),
+  // B48-21: cascade delete prepared statements. SQLite has no ON DELETE
+  // CASCADE configured for these tables, so we tear down each child table
+  // explicitly inside a transaction. Tokens are tied to the users row, so
+  // dropping the row revokes auth.
+  deleteGoalsByUser:    db.prepare("DELETE FROM goals          WHERE userId = ?"),
+  deleteCheckinsByUser: db.prepare("DELETE FROM checkins       WHERE userId = ?"),
+  deletePlantsByUser:   db.prepare("DELETE FROM plants         WHERE userId = ?"),
+  deleteGardenByUser:   db.prepare("DELETE FROM garden         WHERE userId = ?"),
+  deleteJournalByUser:  db.prepare("DELETE FROM journal_entries WHERE userId = ?"),
+  deleteAffirmationsByUser: db.prepare("DELETE FROM affirmations WHERE userId = ?"),
+  deleteMilestonesByUser:   db.prepare("DELETE FROM milestones   WHERE userId = ?"),
+  deleteMessagesByUser: db.prepare("DELETE FROM messages       WHERE userId = ?"),
+  deleteUserById:       db.prepare("DELETE FROM users          WHERE id = ?"),
   // Goals
   insertGoal: db.prepare("INSERT INTO goals (id, userId, type, description, audioUrl, motivation, motivationAudioUrl, horizonDays, targetDate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
   getActiveGoals: db.prepare("SELECT * FROM goals WHERE userId = ? AND status = 'active' ORDER BY type ASC"),
@@ -1268,12 +1281,72 @@ app.get("/api/user/profile", (req, res) => {
   res.json({ email: user.email, name: user.name, streak: user.streak, language: user.language, plan: user.plan });
 });
 
-app.delete("/api/user", (req, res) => {
+// B48-21: account deletion with cascade. Steps:
+//   1) Cancel any active Stripe subscription (best-effort; failure is logged
+//      but does not block deletion — we cannot leave the user with no DB row
+//      yet still active billing).
+//   2) Delete every child row in a single transaction (goals, checkins,
+//      plants, garden, journal_entries, affirmations, milestones, messages).
+//   3) Delete the user row itself, which revokes the auth token (the token
+//      lives in the users row).
+//
+// `/api/user/me` is the canonical path used by the FE; `/api/user` is kept
+// as a compatibility alias for older clients.
+const handleDeleteAccount = async (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  stmts.deleteUser.run(user.email);
+
+  // 1) Stripe — cancel subscription if present. We try the live cancel via
+  //    the Stripe API; if Stripe is not configured (no STRIPE_SECRET_KEY) we
+  //    just zero out the subscription columns locally.
+  if (user.stripeSubscriptionId) {
+    try {
+      if (stripe) {
+        await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+        Sentry.addBreadcrumb({
+          category: "billing",
+          level: "info",
+          message: "delete_account.stripe_canceled",
+          data: { subId: user.stripeSubscriptionId },
+        });
+      }
+    } catch (e) {
+      // Don't block the DB delete — log and move on.
+      Sentry.captureException(e, {
+        tags: { op: "delete_account.stripe_cancel" },
+        extra: { userId: user.id, subId: user.stripeSubscriptionId },
+      });
+    }
+  }
+
+  // 2) + 3) Cascade DB delete inside a transaction so a partial failure
+  //    cannot leave dangling child rows pointing at a deleted user.
+  try {
+    const cascade = db.transaction((uid) => {
+      stmts.deleteCheckinsByUser.run(uid);
+      stmts.deleteJournalByUser.run(uid);
+      stmts.deleteAffirmationsByUser.run(uid);
+      stmts.deleteMilestonesByUser.run(uid);
+      stmts.deleteMessagesByUser.run(uid);
+      stmts.deleteGardenByUser.run(uid);
+      stmts.deletePlantsByUser.run(uid);
+      stmts.deleteGoalsByUser.run(uid);
+      stmts.deleteUserById.run(uid);
+    });
+    cascade(user.id);
+  } catch (e) {
+    Sentry.captureException(e, {
+      tags: { op: "delete_account.cascade" },
+      extra: { userId: user.id },
+    });
+    return res.status(500).json({ error: "Account deletion failed" });
+  }
+
   res.json({ success: true });
-});
+};
+
+app.delete("/api/user/me", handleDeleteAccount);
+app.delete("/api/user", handleDeleteAccount);
 
 app.post("/api/subscription/cancel", (req, res) => {
   const user = getUserByToken(req);
@@ -1309,9 +1382,24 @@ app.post("/api/goals", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
   const { type, description, audioUrl, motivation, motivationAudioUrl, horizonDays } = req.body;
+  // B48-22: enforce 2-of-a-kind cap server-side as a safety net behind the
+  // FE block. type values: 'short' = 7d (cap 2), anything else = 'long' / 90d
+  // (cap 2). Reject with 409 + the canonical FE copy so any legacy client
+  // that misses the FE check still gets the same UX message.
+  const goalType = type || 'long';
+  const activeOfKind = stmts.getActiveGoals
+    .all(user.id)
+    .filter((g) => (g.type || 'long') === goalType);
+  if (activeOfKind.length >= 2) {
+    return res.status(409).json({
+      error: "Cap reached: cancel one to add new",
+      code: "GOAL_CAP_REACHED",
+      kind: goalType,
+    });
+  }
   const id = crypto.randomUUID();
   const targetDate = new Date(Date.now() + (horizonDays || 90) * 86400000).toISOString();
-  stmts.insertGoal.run(id, user.id, type || 'long', description, audioUrl, motivation, motivationAudioUrl, horizonDays || 90, targetDate);
+  stmts.insertGoal.run(id, user.id, goalType, description, audioUrl, motivation, motivationAudioUrl, horizonDays || 90, targetDate);
   res.json({ id, success: true });
 });
 

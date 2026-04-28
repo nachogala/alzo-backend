@@ -25,6 +25,11 @@ const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
 // ── SQLite persistence ──────────────────────────────────────────────
 const db = new Database(process.env.DB_PATH || "./alzo.db");
 db.pragma("journal_mode = WAL");
+// B48-29: enforce FK so a partial cascade can never leave dangling rows. The
+// SQLite default is off; better-sqlite3 inherits that, but our FK declarations
+// in the schema are useless without this. Turning it on also surfaces FK
+// violations as actionable Sentry events instead of silent corruption.
+db.pragma("foreign_keys = ON");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -1293,8 +1298,16 @@ app.get("/api/user/profile", (req, res) => {
 // `/api/user/me` is the canonical path used by the FE; `/api/user` is kept
 // as a compatibility alias for older clients.
 const handleDeleteAccount = async (req, res) => {
+  // B48-29: tag the entire flow so every event raised below — Stripe cancel,
+  // each cascade step, the final user delete — groups into ALZO-BACKEND-3
+  // and the FK violation that opened this ticket can be diagnosed at the
+  // sub-step level.
+  Sentry.setTag("flow", "delete_account");
+
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  Sentry.setUser({ id: user.id, email: user.email });
 
   // 1) Stripe — cancel subscription if present. We try the live cancel via
   //    the Stripe API; if Stripe is not configured (no STRIPE_SECRET_KEY) we
@@ -1313,31 +1326,58 @@ const handleDeleteAccount = async (req, res) => {
     } catch (e) {
       // Don't block the DB delete — log and move on.
       Sentry.captureException(e, {
-        tags: { op: "delete_account.stripe_cancel" },
+        tags: { flow: "delete_account", step: "stripe_cancel" },
         extra: { userId: user.id, subId: user.stripeSubscriptionId },
       });
     }
   }
 
-  // 2) + 3) Cascade DB delete inside a transaction so a partial failure
-  //    cannot leave dangling child rows pointing at a deleted user.
+  // 2) + 3) Cascade DB delete inside a transaction. Order matters because
+  //    PRAGMA foreign_keys is now ON (see init): rows that are referenced by
+  //    other rows must go last. Deletion order, child → parent:
+  //      checkins (refs goals)            → must precede goals
+  //      garden   (refs plants + goals)   → must precede plants & goals
+  //      plants   (refs goals)            → must precede goals
+  //      goals
+  //      journal_entries / affirmations / milestones / messages — refs only users
+  //      users                            → last
+  //
+  //    Each step runs its own try/Sentry.captureException with a  tag
+  //    so Sentry can pin-point which child table is the FK culprit when the
+  //    edge case fires (this is what blew up in ALZO-BACKEND-3 before B48-29).
+  const STEPS = [
+    ["delete_checkins",     stmts.deleteCheckinsByUser],
+    ["delete_garden",       stmts.deleteGardenByUser],
+    ["delete_plants",       stmts.deletePlantsByUser],
+    ["delete_goals",        stmts.deleteGoalsByUser],
+    ["delete_journal",      stmts.deleteJournalByUser],
+    ["delete_affirmations", stmts.deleteAffirmationsByUser],
+    ["delete_milestones",   stmts.deleteMilestonesByUser],
+    ["delete_messages",     stmts.deleteMessagesByUser],
+    ["delete_user",         stmts.deleteUserById],
+  ];
+
   try {
     const cascade = db.transaction((uid) => {
-      stmts.deleteCheckinsByUser.run(uid);
-      stmts.deleteJournalByUser.run(uid);
-      stmts.deleteAffirmationsByUser.run(uid);
-      stmts.deleteMilestonesByUser.run(uid);
-      stmts.deleteMessagesByUser.run(uid);
-      stmts.deleteGardenByUser.run(uid);
-      stmts.deletePlantsByUser.run(uid);
-      stmts.deleteGoalsByUser.run(uid);
-      stmts.deleteUserById.run(uid);
+      for (const [step, stmt] of STEPS) {
+        try {
+          stmt.run(uid);
+        } catch (stepErr) {
+          // Re-throw to abort the transaction, but also tag the failure with
+          // the exact step so Sentry surfaces the FK culprit.
+          Sentry.captureException(stepErr, {
+            tags: { flow: "delete_account", step },
+            extra: { userId: uid },
+          });
+          throw stepErr;
+        }
+      }
     });
     cascade(user.id);
   } catch (e) {
     Sentry.captureException(e, {
-      tags: { op: "delete_account.cascade" },
-      extra: { userId: user.id },
+      tags: { flow: "delete_account", step: "cascade" },
+      extra: { userId: user.id, message: e?.message, code: e?.code },
     });
     return res.status(500).json({ error: "Account deletion failed" });
   }

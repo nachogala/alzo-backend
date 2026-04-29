@@ -805,6 +805,8 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     let voiceReady = !!((audioFiles.length > 0 || combinedVoicePath) && ELEVENLABS_API_KEY);
 
     const sessionId = Date.now().toString();
+    const voiceOwner = getUserByToken(req);
+    const voiceOwnerId = voiceOwner?.id ? String(voiceOwner.id).replace(/[^a-zA-Z0-9_-]/g, '') : null;
     const voiceDebug = {
       cloneMode: voiceReady ? 'pending' : 'not_ready',
       sampleCount: 0,
@@ -826,15 +828,35 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
 
     if (allVoiceFiles.length > 0) {
       const voiceManifest = path.join(__dirname, "uploads", `voice_manifest_${sessionId}.json`);
-      fs.writeFileSync(voiceManifest, JSON.stringify(allVoiceFiles));
-      const destPath = path.join(__dirname, "uploads", `voice_${sessionId}.m4a`);
-      fs.copyFileSync(allVoiceFiles[allVoiceFiles.length - 1], destPath);
-      allVoiceFiles.forEach((f) => { if (f !== destPath) fs.unlink(f, () => {}); });
+      const persistedVoiceFiles = allVoiceFiles.map((sourcePath, index) => {
+        const ext = path.extname(sourcePath) || ".m4a";
+        const destPath = path.join(__dirname, "uploads", `voice_${sessionId}_${index + 1}${ext}`);
+        fs.copyFileSync(sourcePath, destPath);
+        return destPath;
+      });
+
+      // Backwards-compatible single-sample path for first-output generation by sessionId.
+      const legacyVoicePath = path.join(__dirname, "uploads", `voice_${sessionId}.m4a`);
+      fs.copyFileSync(persistedVoiceFiles[persistedVoiceFiles.length - 1], legacyVoicePath);
+
+      // User-scoped single-sample path for daily affirmation re-clone fallback.
+      if (voiceOwnerId) {
+        const userVoicePath = path.join(__dirname, "uploads", `voice_user_${voiceOwnerId}_${sessionId}.m4a`);
+        fs.copyFileSync(persistedVoiceFiles[persistedVoiceFiles.length - 1], userVoicePath);
+      }
+
+      fs.writeFileSync(voiceManifest, JSON.stringify(persistedVoiceFiles));
+      allVoiceFiles.forEach((f) => fs.unlink(f, () => {}));
+      voiceDebug.sampleFiles = persistedVoiceFiles.map(f => path.basename(f));
       res.json({ voiceReady, context, sessionId, detectedGender, language, voiceDebug });
     } else {
       res.json({ voiceReady, context, sessionId, detectedGender, language, voiceDebug });
     }
   } catch (err) {
+    Sentry.captureException(err, {
+      tags: { area: 'voice_upload', endpoint: 'onboarding' },
+      extra: { fileKeys: Object.keys(req.files || {}) },
+    });
     console.error("Onboarding error:", err);
     res.status(500).json({ error: "Onboarding failed" });
   }
@@ -893,6 +915,10 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
 
     res.json({ affirmationText, audioUrl, voiceDebug });
   } catch (err) {
+    Sentry.captureException(err, {
+      tags: { area: 'voice_clone', endpoint: 'generate_affirmation' },
+      extra: { hasSessionId: Boolean(req.body?.sessionId), language: req.body?.language || null },
+    });
     console.error("Error generating affirmation:", err);
     res.status(500).json({ error: "Failed to generate affirmation" });
   }
@@ -953,13 +979,20 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
     const cachedRow = stmts.getVoiceId.get(user.id);
     const cachedVoiceId = cachedRow?.elevenlabsVoiceId || null;
 
-    // Find user's voice sample by any stored sessionId pattern (uploads dir)
+    // Find this user's retained sample for re-clone fallback. Prefer user-scoped
+    // files; only fall back to legacy session-only files for old pre-fix users.
     const uploadsDir = path.join(__dirname, "uploads");
+    const safeUserId = String(user.id).replace(/[^a-zA-Z0-9_-]/g, '');
     const userVoiceCandidates = fs.readdirSync(uploadsDir)
+      .filter((f) => f.startsWith(`voice_user_${safeUserId}_`) && /\.(m4a|webm)$/.test(f))
+      .sort()
+      .reverse();
+    const legacyVoiceCandidates = fs.readdirSync(uploadsDir)
       .filter((f) => /^voice_\d+\.(m4a|webm)$/.test(f))
       .sort()
       .reverse();
-    const voicePath = userVoiceCandidates.length ? path.join(uploadsDir, userVoiceCandidates[0]) : null;
+    const voiceCandidate = userVoiceCandidates[0] || legacyVoiceCandidates[0] || null;
+    const voicePath = voiceCandidate ? path.join(uploadsDir, voiceCandidate) : null;
 
     if (ELEVENLABS_API_KEY && (cachedVoiceId || voicePath)) {
       const cloneResult = await cloneVoiceAndSpeak(
@@ -1003,6 +1036,10 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
 
     res.json({ dateKey, affirmationText, audioUrl, voiceMode, cached: false });
   } catch (err) {
+    Sentry.captureException(err, {
+      tags: { area: 'voice_daily', endpoint: 'affirmation_today' },
+      extra: { hasContext: Boolean(req.body?.context), language: req.body?.language || null },
+    });
     console.error("affirmation/today error:", err);
     res.status(500).json({ error: "Failed to generate today's affirmation" });
   }
@@ -1410,9 +1447,52 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     app: "ALZO",
+    version: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_SHA || "unknown",
     openai: !!process.env.OPENAI_API_KEY,
     elevenlabs: !!ELEVENLABS_API_KEY,
   });
+});
+
+app.get("/api/health/voice", async (req, res) => {
+  const user = getUserByToken(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const cachedVoiceId = stmts.getVoiceId.get(user.id)?.elevenlabsVoiceId || null;
+  if (!cachedVoiceId) {
+    return res.json({ status: "missing", hasVoiceId: false, providerReachable: !!ELEVENLABS_API_KEY });
+  }
+
+  if (!ELEVENLABS_API_KEY) {
+    return res.json({ status: "unknown", hasVoiceId: true, providerReachable: false });
+  }
+
+  try {
+    const providerRes = await withTimeout(fetch(`${ELEVENLABS_BASE}/voices/${cachedVoiceId}`, {
+      headers: { "xi-api-key": ELEVENLABS_API_KEY },
+    }), 10000);
+
+    if (!providerRes) {
+      return res.status(504).json({ status: "timeout", hasVoiceId: true, providerReachable: false });
+    }
+
+    if (providerRes.status === 404) {
+      return res.json({ status: "stale", hasVoiceId: true, providerReachable: true });
+    }
+
+    if (!providerRes.ok) {
+      Sentry.captureMessage('ElevenLabs voice health check failed', {
+        level: 'warning',
+        tags: { area: 'voice_health', endpoint: 'health_voice' },
+        extra: { providerStatus: providerRes.status },
+      });
+      return res.status(502).json({ status: "provider_error", hasVoiceId: true, providerReachable: true, providerStatus: providerRes.status });
+    }
+
+    return res.json({ status: "ok", hasVoiceId: true, providerReachable: true });
+  } catch (err) {
+    Sentry.captureException(err, { tags: { area: 'voice_health', endpoint: 'health_voice' } });
+    return res.status(500).json({ status: "error", hasVoiceId: true, providerReachable: false });
+  }
 });
 
 // ── ALIGNMENT SYSTEM ENDPOINTS ──────────────────────────────────────
@@ -1447,9 +1527,13 @@ app.get("/api/goals", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
   const rows = stmts.getActiveGoals.all(user.id);
-  // B48-4: FE reads `durationDays` per HomeScreen.js:121 but DB column is
-  // `horizonDays`. Send both — FE-side rename can land later without a BE bump.
-  const goals = rows.map((g) => ({ ...g, durationDays: g.horizonDays }));
+  // B48-4/Day 17: DB column is `startDate` + `horizonDays`; FE needs
+  // canonical `startedAt` + `durationDays` so day count/progress do not drift.
+  const goals = rows.map((goal) => ({
+    ...goal,
+    startedAt: goal.startedAt || goal.startDate || goal.createdAt || null,
+    durationDays: goal.durationDays || goal.horizonDays || (goal.type === 'short' ? 7 : 90),
+  }));
   res.json({ goals });
 });
 

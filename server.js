@@ -288,8 +288,13 @@ function getUserByToken(req) {
 }
 
 // Ensure directories exist
+const AUDIO_STORAGE_DIR = process.env.AUDIO_STORAGE_DIR
+  ? path.resolve(process.env.AUDIO_STORAGE_DIR)
+  : path.join(__dirname, "public", "audio");
+const AUDIO_PUBLIC_PATH = "/audio";
+
 fs.mkdirSync(path.join(__dirname, "uploads"), { recursive: true });
-fs.mkdirSync(path.join(__dirname, "public", "audio"), { recursive: true });
+fs.mkdirSync(AUDIO_STORAGE_DIR, { recursive: true });
 
 // Middleware
 // Stripe webhook requires the raw body to verify the signature. Keep it
@@ -299,6 +304,10 @@ app.use((req, res, next) => {
   if (req.originalUrl === "/api/stripe/webhook") return next();
   return express.json({ limit: "50mb" })(req, res, next);
 });
+app.use(AUDIO_PUBLIC_PATH, express.static(AUDIO_STORAGE_DIR, {
+  immutable: true,
+  maxAge: "30d",
+}));
 app.use(express.static("public"));
 
 // Multer for voice uploads
@@ -330,6 +339,21 @@ const APP_URL = process.env.APP_URL || "https://alzo.thenetmencorp.com";
 // ElevenLabs config
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_BASE = "https://api.elevenlabs.io/v1";
+
+function recordVoiceMetric(event, fields = {}) {
+  const payload = {
+    event,
+    timestamp: new Date().toISOString(),
+    ...fields,
+  };
+  console.log(`[voice_metric] ${JSON.stringify(payload)}`);
+  Sentry.addBreadcrumb({
+    category: "voice.metric",
+    level: fields.level || "info",
+    message: event,
+    data: payload,
+  });
+}
 
 // ── Generate affirmation text via GPT-4o ─────────────────────────────
 
@@ -445,14 +469,17 @@ function withTimeout(promise, ms) {
 }
 
 async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existingVoiceId = null) {
+  const voiceFiles = (Array.isArray(voiceFilePath) ? voiceFilePath : [voiceFilePath]).filter(Boolean);
   const debug = {
     cloneMode: 'not_attempted',
-    sampleCount: Array.isArray(voiceFilePath) ? voiceFilePath.length : (voiceFilePath ? 1 : 0),
-    sampleFiles: (Array.isArray(voiceFilePath) ? voiceFilePath : [voiceFilePath]).filter(Boolean).map(fp => path.basename(fp)),
+    sampleCount: voiceFiles.length,
+    sampleFiles: voiceFiles.map(fp => path.basename(fp)),
     fallbackUsed: false,
     fallbackBlocked: false,
     customVoiceId: null,
     playbackVoiceId: null,
+    staleCachedVoiceId: null,
+    staleVoiceReclone: false,
     modelId: null,
     error: null,
   };
@@ -463,7 +490,9 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
     return { audioUrl: null, voiceDebug: debug, voiceId: null };
   }
 
-  // Fast path: user already has a cached voice_id → skip the clone (25s → 3s)
+  // Fast path: user already has a cached voice_id → skip the clone (25s → 3s).
+  // If the provider says that cached voice is gone, treat it as stale and
+  // re-clone from the retained sample instead of silently falling back forever.
   if (existingVoiceId) {
     debug.customVoiceId = existingVoiceId;
     debug.playbackVoiceId = existingVoiceId;
@@ -474,12 +503,7 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
         debug.cloneMode = 'tts_failed_on_reuse';
         debug.error = 'speech generation failed with cached voice_id';
         debug.fallbackBlocked = true;
-        Sentry.addBreadcrumb({
-          category: 'elevenlabs.clone',
-          level: 'error',
-          message: 'tts_failed_on_reuse',
-          data: { voiceId: existingVoiceId, language },
-        });
+        recordVoiceMetric('tts_failed_on_reuse', { level: 'error', voiceId: existingVoiceId, language });
         Sentry.captureMessage('elevenlabs.tts_failed_on_reuse', {
           level: 'warning',
           tags: { component: 'elevenlabs', cloneMode: 'tts_failed_on_reuse' },
@@ -488,16 +512,20 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
         return { audioUrl: null, voiceDebug: debug, voiceId: existingVoiceId };
       }
       debug.modelId = speech.modelId;
+      recordVoiceMetric('tts_reused_cached_voice', { voiceId: existingVoiceId, language, modelId: speech.modelId });
       return { audioUrl: speech.audioUrl, voiceDebug: debug, voiceId: existingVoiceId };
     } catch (err) {
       console.error('TTS with cached voice failed:', err.message);
-      debug.cloneMode = 'tts_error_on_reuse';
+      const providerBody = String(err.body || err.message || '');
+      const staleCachedVoice = err.status === 404 || providerBody.includes('voice_not_found') || providerBody.includes('not_found');
+      debug.cloneMode = staleCachedVoice ? 'stale_cached_voice' : 'tts_error_on_reuse';
       debug.error = err.message;
-      debug.fallbackBlocked = true;
+      debug.fallbackBlocked = !staleCachedVoice;
+      debug.staleCachedVoiceId = staleCachedVoice ? existingVoiceId : null;
       Sentry.addBreadcrumb({
         category: 'elevenlabs.clone',
         level: 'error',
-        message: 'tts_error_on_reuse',
+        message: debug.cloneMode,
         data: {
           voiceId: existingVoiceId,
           language,
@@ -506,16 +534,29 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
         },
       });
       Sentry.captureException(err, {
-        tags: { component: 'elevenlabs', cloneMode: 'tts_error_on_reuse' },
+        tags: { component: 'elevenlabs', cloneMode: debug.cloneMode },
         extra: { voiceId: existingVoiceId, language },
       });
-      return { audioUrl: null, voiceDebug: debug, voiceId: existingVoiceId };
+
+      if (!staleCachedVoice || voiceFiles.length === 0) {
+        // A known-stale voice with no retained sample must be cleared by the
+        // caller so future runs do not keep retrying a dead provider id.
+        return { audioUrl: null, voiceDebug: debug, voiceId: staleCachedVoice ? null : existingVoiceId };
+      }
+
+      recordVoiceMetric('stale_cached_voice_reclone', { level: 'warning', voiceId: existingVoiceId, language, sampleCount: voiceFiles.length });
+      debug.cloneMode = 'stale_reclone_attempted';
+      debug.staleVoiceReclone = true;
+      debug.customVoiceId = null;
+      debug.playbackVoiceId = null;
+      debug.error = null;
+      debug.fallbackBlocked = false;
     }
   }
 
   try {
     const formData = new FormData();
-    formData.append("name", `alzo_${Date.now()}`);
+    formData.append("name", `alzo_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`);
     formData.append("description", "ALZO user voice clone for affirmations");
     // B48-3: clean up sample audio before fingerprinting — kicks clone quality
     // up materially when source has room tone, breath, fan noise, etc.
@@ -683,10 +724,11 @@ async function generateSpeech(text, voiceId, language) {
   }
 
   const audioBuffer = Buffer.from(await ttsRes.arrayBuffer());
-  const filename = `affirmation_${Date.now()}.mp3`;
-  const filepath = path.join(__dirname, "public", "audio", filename);
+  const filename = `affirmation_${Date.now()}_${crypto.randomBytes(8).toString("hex")}.mp3`;
+  const filepath = path.join(AUDIO_STORAGE_DIR, filename);
   fs.writeFileSync(filepath, audioBuffer);
-  return { audioUrl: `/audio/${filename}`, voiceId, modelId: model };
+  recordVoiceMetric('tts_audio_written', { voiceId, language, modelId: model, bytes: audioBuffer.length, storageDir: AUDIO_STORAGE_DIR });
+  return { audioUrl: `${AUDIO_PUBLIC_PATH}/${filename}`, voiceId, modelId: model };
 }
 
 // ── Onboarding endpoint ─────────────────────────────────────────────
@@ -905,6 +947,9 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       // Persist the new voice_id so the next affirmation skips the clone step.
       if (authedUser && cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
         stmts.setVoiceId.run(cloneResult.voiceId, authedUser.id);
+      } else if (authedUser && cachedVoiceId && cloneResult.voiceDebug?.staleCachedVoiceId && !cloneResult.voiceId) {
+        stmts.setVoiceId.run(null, authedUser.id);
+        recordVoiceMetric('stale_cached_voice_cleared', { userId: authedUser.id, voiceId: cachedVoiceId, endpoint: 'generate_affirmation' });
       }
       // Do NOT delete voicePath — daily affirmations need the same sample.
     } else {
@@ -1006,6 +1051,9 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
       voiceMode = cloneResult.voiceDebug.cloneMode || "unknown";
       if (cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
         stmts.setVoiceId.run(cloneResult.voiceId, user.id);
+      } else if (cachedVoiceId && cloneResult.voiceDebug?.staleCachedVoiceId && !cloneResult.voiceId) {
+        stmts.setVoiceId.run(null, user.id);
+        recordVoiceMetric('stale_cached_voice_cleared', { userId: user.id, voiceId: cachedVoiceId, endpoint: 'affirmation_today' });
       }
     }
 
@@ -1450,6 +1498,11 @@ app.get("/api/health", (req, res) => {
     version: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_SHA || "unknown",
     openai: !!process.env.OPENAI_API_KEY,
     elevenlabs: !!ELEVENLABS_API_KEY,
+    audioStorage: {
+      path: AUDIO_STORAGE_DIR,
+      publicPath: AUDIO_PUBLIC_PATH,
+      persistentConfigured: Boolean(process.env.AUDIO_STORAGE_DIR),
+    },
   });
 });
 

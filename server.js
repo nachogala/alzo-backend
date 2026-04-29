@@ -1896,6 +1896,18 @@ app.put("/api/plants/:id/color", (req, res) => {
 
 
 
+// Normalize expected upload validation failures before Sentry so malformed
+// clients/QA probes get a clean 400 instead of lowering crash-free health.
+app.use((err, req, res, next) => {
+  if (err && err.message === "Only audio files are allowed") {
+    return res.status(400).json({ error: "Only audio files are allowed" });
+  }
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ error: err.message, code: err.code });
+  }
+  return next(err);
+});
+
 // Sentry error handler — must be registered after all routes.
 Sentry.setupExpressErrorHandler(app);
 

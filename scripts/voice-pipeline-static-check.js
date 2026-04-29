@@ -13,6 +13,8 @@ const checks = [
   [files.server, 'f.startsWith(`voice_user_${safeUserId}_`)', 'daily fallback prefers authenticated user sample'],
   [files.server, 'voiceCandidate = userVoiceCandidates[0] || legacyVoiceCandidates[0]', 'daily fallback keeps legacy compatibility only after user sample'],
   [files.server, 'app.get("/api/health/voice", async (req, res) => {', 'voice health endpoint exists'],
+  [files.server, 'err.message === "Only audio files are allowed"', 'invalid audio uploads are normalized before Sentry'],
+  [files.server, 'err instanceof multer.MulterError', 'multer validation errors return 400 before Sentry'],
   [files.server, '`${ELEVENLABS_BASE}/voices/${cachedVoiceId}`', 'voice health probes provider voice id'],
   [files.server, 'status: "stale"', 'voice health exposes stale cached voice state'],
   [files.server, "tags: { area: 'voice_upload', endpoint: 'onboarding' }", 'onboarding failures captured to Sentry'],

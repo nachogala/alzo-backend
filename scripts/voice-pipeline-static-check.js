@@ -21,6 +21,8 @@ const checks = [
   [files.server, "recordVoiceMetric('stale_cached_voice_reclone'", 'stale cached voice triggers re-clone metric when samples exist'],
   [files.server, "stmts.setVoiceId.run(null", 'stale cached voice id is cleared when re-clone cannot recover'],
   [files.server, 'AUDIO_STORAGE_DIR = process.env.AUDIO_STORAGE_DIR', 'audio storage dir can be mounted outside ephemeral public assets'],
+  [files.server, 'UPLOAD_STORAGE_DIR = process.env.UPLOAD_STORAGE_DIR', 'upload/sample storage dir can be mounted outside ephemeral app filesystem'],
+  [files.server, 'app.use(UPLOAD_PUBLIC_PATH, express.static(UPLOAD_STORAGE_DIR', 'journal and retained samples are served from configured upload storage'],
   [files.server, 'crypto.randomBytes(8).toString("hex")', 'generated audio filenames include collision-resistant entropy'],
   [files.server, "tags: { area: 'voice_upload', endpoint: 'onboarding' }", 'onboarding failures captured to Sentry'],
   [files.server, "tags: { area: 'voice_clone', endpoint: 'generate_affirmation' }", 'first output voice failures captured to Sentry'],

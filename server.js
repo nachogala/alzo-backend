@@ -287,13 +287,18 @@ function getUserByToken(req) {
   return stmts.getByToken.get(token) || null;
 }
 
-// Ensure directories exist
+// Ensure directories exist. Railway has a persistent volume mounted at /data;
+// production should set AUDIO_STORAGE_DIR=/data/audio and UPLOAD_STORAGE_DIR=/data/uploads.
 const AUDIO_STORAGE_DIR = process.env.AUDIO_STORAGE_DIR
   ? path.resolve(process.env.AUDIO_STORAGE_DIR)
   : path.join(__dirname, "public", "audio");
 const AUDIO_PUBLIC_PATH = "/audio";
+const UPLOAD_STORAGE_DIR = process.env.UPLOAD_STORAGE_DIR
+  ? path.resolve(process.env.UPLOAD_STORAGE_DIR)
+  : path.join(__dirname, "uploads");
+const UPLOAD_PUBLIC_PATH = "/uploads";
 
-fs.mkdirSync(path.join(__dirname, "uploads"), { recursive: true });
+fs.mkdirSync(UPLOAD_STORAGE_DIR, { recursive: true });
 fs.mkdirSync(AUDIO_STORAGE_DIR, { recursive: true });
 
 // Middleware
@@ -308,11 +313,15 @@ app.use(AUDIO_PUBLIC_PATH, express.static(AUDIO_STORAGE_DIR, {
   immutable: true,
   maxAge: "30d",
 }));
+app.use(UPLOAD_PUBLIC_PATH, express.static(UPLOAD_STORAGE_DIR, {
+  immutable: true,
+  maxAge: "30d",
+}));
 app.use(express.static("public"));
 
 // Multer for voice uploads
 const upload = multer({
-  dest: "uploads/",
+  dest: UPLOAD_STORAGE_DIR,
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith("audio/")) {
@@ -869,21 +878,21 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
     voiceDebug.sampleFiles = allVoiceFiles.map(f => path.basename(f));
 
     if (allVoiceFiles.length > 0) {
-      const voiceManifest = path.join(__dirname, "uploads", `voice_manifest_${sessionId}.json`);
+      const voiceManifest = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
       const persistedVoiceFiles = allVoiceFiles.map((sourcePath, index) => {
         const ext = path.extname(sourcePath) || ".m4a";
-        const destPath = path.join(__dirname, "uploads", `voice_${sessionId}_${index + 1}${ext}`);
+        const destPath = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}_${index + 1}${ext}`);
         fs.copyFileSync(sourcePath, destPath);
         return destPath;
       });
 
       // Backwards-compatible single-sample path for first-output generation by sessionId.
-      const legacyVoicePath = path.join(__dirname, "uploads", `voice_${sessionId}.m4a`);
+      const legacyVoicePath = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.m4a`);
       fs.copyFileSync(persistedVoiceFiles[persistedVoiceFiles.length - 1], legacyVoicePath);
 
       // User-scoped single-sample path for daily affirmation re-clone fallback.
       if (voiceOwnerId) {
-        const userVoicePath = path.join(__dirname, "uploads", `voice_user_${voiceOwnerId}_${sessionId}.m4a`);
+        const userVoicePath = path.join(UPLOAD_STORAGE_DIR, `voice_user_${voiceOwnerId}_${sessionId}.m4a`);
         fs.copyFileSync(persistedVoiceFiles[persistedVoiceFiles.length - 1], userVoicePath);
       }
 
@@ -919,9 +928,9 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     // 2. Generate audio — use all voice samples if available
     let audioUrl = null;
     let voiceDebug = { cloneMode: 'not_ready', fallbackUsed: false, error: null };
-    const manifestPath = path.join(__dirname, "uploads", `voice_manifest_${sessionId}.json`);
-    const voicePathM4a = path.join(__dirname, "uploads", `voice_${sessionId}.m4a`);
-    const voicePathWebm = path.join(__dirname, "uploads", `voice_${sessionId}.webm`);
+    const manifestPath = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
+    const voicePathM4a = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.m4a`);
+    const voicePathWebm = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.webm`);
     const voicePath = fs.existsSync(voicePathM4a) ? voicePathM4a : (fs.existsSync(voicePathWebm) ? voicePathWebm : null);
 
     if (sessionId && voicePath) {
@@ -1026,7 +1035,7 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
 
     // Find this user's retained sample for re-clone fallback. Prefer user-scoped
     // files; only fall back to legacy session-only files for old pre-fix users.
-    const uploadsDir = path.join(__dirname, "uploads");
+    const uploadsDir = UPLOAD_STORAGE_DIR;
     const safeUserId = String(user.id).replace(/[^a-zA-Z0-9_-]/g, '');
     const userVoiceCandidates = fs.readdirSync(uploadsDir)
       .filter((f) => f.startsWith(`voice_user_${safeUserId}_`) && /\.(m4a|webm)$/.test(f))
@@ -1503,6 +1512,11 @@ app.get("/api/health", (req, res) => {
       publicPath: AUDIO_PUBLIC_PATH,
       persistentConfigured: Boolean(process.env.AUDIO_STORAGE_DIR),
     },
+    uploadStorage: {
+      path: UPLOAD_STORAGE_DIR,
+      publicPath: UPLOAD_PUBLIC_PATH,
+      persistentConfigured: Boolean(process.env.UPLOAD_STORAGE_DIR),
+    },
   });
 });
 
@@ -1763,7 +1777,7 @@ app.post("/api/journal", upload.single("audio"), (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
   const id = crypto.randomUUID();
-  const audioUrl = req.file ? `/uploads/${req.file.filename}` : null;
+  const audioUrl = req.file ? `${UPLOAD_PUBLIC_PATH}/${req.file.filename}` : null;
   const duration = parseInt(req.body.duration) || 0;
   stmts.insertJournal.run(id, user.id, req.body.goalId, audioUrl, duration);
   res.json({ id, success: true });

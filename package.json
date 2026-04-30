@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "qa:voice-static": "node scripts/voice-pipeline-static-check.js"
+    "qa:voice-static": "node scripts/voice-pipeline-static-check.js",
+    "test": "jest --runInBand",
+    "test:voice": "jest --runInBand __tests__/voice-flow.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
@@ -19,5 +21,21 @@
     "multer": "^1.4.5-lts.1",
     "openai": "^4.78.0",
     "stripe": "^22.0.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.2.2",
+    "undici": "^7.25.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^@sentry/node$": "<rootDir>/__tests__/__mocks__/sentry-stub.js",
+      "^openai$": "<rootDir>/__tests__/__mocks__/openai-stub.js"
+    },
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/__tests__/__mocks__/"
+    ]
   }
 }

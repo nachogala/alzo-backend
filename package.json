@@ -17,8 +17,6 @@
     "better-sqlite3": "^12.8.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "ffmpeg-static": "^5.3.0",
-    "ffprobe-static": "^3.1.0",
     "google-auth-library": "^10.6.2",
     "multer": "^1.4.5-lts.1",
     "openai": "^4.78.0",

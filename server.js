@@ -337,7 +337,21 @@ const upload = multer({
 });
 
 // OpenAI client
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+let _openai = null;
+const openai = new Proxy({}, {
+  get(_t, prop) {
+    if (!_openai) {
+      if (!process.env.OPENAI_API_KEY) {
+        const err = new Error("OPENAI_API_KEY not set");
+        err.code = "OPENAI_KEY_MISSING";
+        throw err;
+      }
+      _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    }
+    const v = _openai[prop];
+    return typeof v === "function" ? v.bind(_openai) : v;
+  }
+});
 const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID || "";
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "com.alzo.app";
 const googleAuthClient = GOOGLE_WEB_CLIENT_ID ? new OAuth2Client(GOOGLE_WEB_CLIENT_ID) : null;

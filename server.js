@@ -364,6 +364,10 @@ const openai = new Proxy({}, {
     return typeof v === "function" ? v.bind(_openai) : v;
   }
 });
+
+// 2026-05-04: model name mapping. DeepSeek uses deepseek-v4-{flash,pro} instead of gpt-4o-{mini,}.
+const _DEFAULT_MODEL = process.env.OPENAI_MODEL_DEFAULT || (process.env.DEEPSEEK_API_KEY ? "deepseek-v4-pro" : "gpt-4o");
+const _MINI_MODEL = process.env.OPENAI_MODEL_MINI || (process.env.DEEPSEEK_API_KEY ? "deepseek-v4-flash" : "gpt-4o-mini");
 const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID || "";
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "com.alzo.app";
 const googleAuthClient = GOOGLE_WEB_CLIENT_ID ? new OAuth2Client(GOOGLE_WEB_CLIENT_ID) : null;
@@ -435,7 +439,7 @@ async function generateAffirmation(context, language) {
   const langInstruction = LANGUAGE_INSTRUCTIONS[language] || LANGUAGE_INSTRUCTIONS['en-US'];
 
   const response = await openai.chat.completions.create({
-    model: "gpt-4o",
+    model: _DEFAULT_MODEL,
     messages: [
       {
         role: "system",
@@ -859,7 +863,7 @@ async function detectGender(transcriptions) {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: _MINI_MODEL,
         messages: [
           { role: 'system', content: 'You detect the speaker\'s gender from their speech. Reply with ONLY "male" or "female". Base it on pronouns, names, or contextual clues. If unclear, reply "unknown".' },
           { role: 'user', content: `Detect gender from this speech: "${combined.substring(0, 500)}"` }
@@ -1732,7 +1736,7 @@ app.post("/api/goals/:id/complete", async (req, res) => {
     const alignedDays = checkins.filter(c => c.alignment === 'yes' || c.alignment === 'mostly').length;
 
     const chronicleRes = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: _DEFAULT_MODEL,
       messages: [
         {
           role: "system",
@@ -1957,7 +1961,7 @@ async function generateMilestoneNarrative(user, milestone, goals, checkins) {
   const alignedDays = checkins.filter(c => c.alignment === 'yes' || c.alignment === 'mostly').length;
 
   const response = await openai.chat.completions.create({
-    model: "gpt-4o",
+    model: _DEFAULT_MODEL,
     messages: [
       {
         role: "system",

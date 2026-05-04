@@ -18,6 +18,10 @@ const crypto = require("crypto");
 const Database = require("better-sqlite3");
 const { OAuth2Client } = require("google-auth-library");
 const appleSignin = require("apple-signin-auth");
+// feature/voice-quality-detector: capa 1 (pre-clone) + capa 2 (post-clone)
+// audio quality detector. Backs the Sentry `elevenlabs.clone_failed` 46-hit
+// regression observed in Build 51.
+const voiceValidator = require("./backend/voice_validator");
 
 const app = express();
 const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
@@ -636,6 +640,47 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
     }
 
     debug.modelId = speech.modelId;
+
+    // ── Capa 2: post-clone TTS render validator ─────────────────────
+    // ElevenLabs sometimes returns a voice_id whose first synth is silence
+    // or a 1s glitch. Verify the rendered MP3 is at least 4s of real audio
+    // before handing the voice to the user. Failure-soft if decoder unavail.
+    Sentry.setTag('voice_validator_step', 'post_clone');
+    const v2 = await voiceValidator.validateTtsRender(speech.localFilePath);
+    if (!v2.ok) {
+      // Clean up: delete the bad voice from ElevenLabs AND the bad MP3 from
+      // disk so it can never be served, then surface a structured error so
+      // the caller returns 502 VOICE_CLONE_GLITCHED.
+      fetch(`${ELEVENLABS_BASE}/voices/${voice_id}`, { method: 'DELETE', headers: { 'xi-api-key': ELEVENLABS_API_KEY } }).catch(() => {});
+      try { if (speech.localFilePath) fs.unlinkSync(speech.localFilePath); } catch {}
+      debug.cloneMode = 'clone_glitched';
+      debug.error = `clone glitched (duration=${v2.duration}s peak=${v2.peak})`;
+      debug.fallbackBlocked = true;
+      debug.cloneVerified = false;
+      debug.errorCode = v2.code;
+      debug.errorHttp = v2.http;
+      debug.errorMessage = v2.message;
+      debug.validatorDuration = v2.duration;
+      debug.validatorPeak = v2.peak;
+      recordVoiceMetric('clone_glitched', { level: 'error', voiceId: voice_id, language, duration: v2.duration, peak: v2.peak });
+      Sentry.captureMessage('voice_validator.post_clone_rejected', {
+        level: 'error',
+        tags: { component: 'voice_validator', step: 'post_clone', code: v2.code },
+        extra: { voiceId: voice_id, language, duration: v2.duration, peak: v2.peak, tooShort: v2.tooShort, tooQuiet: v2.tooQuiet },
+      });
+      return { audioUrl: null, voiceDebug: debug, voiceId: null };
+    }
+    debug.cloneVerified = true;
+    debug.validatorDuration = v2.duration;
+    debug.validatorPeak = v2.peak;
+    debug.validatorSoft = !!v2.soft;
+    Sentry.addBreadcrumb({
+      category: 'voice_validator',
+      level: 'info',
+      message: 'post_clone_passed',
+      data: { voiceId: voice_id, duration: v2.duration, peak: v2.peak, soft: !!v2.soft },
+    });
+
     // PERSIST the cloned voice so daily affirmations can reuse it. Caller must
     // save voiceId to the user row in DB so next call hits the reuse fast path.
     return { audioUrl: speech.audioUrl, voiceDebug: debug, voiceId: voice_id };
@@ -737,7 +782,7 @@ async function generateSpeech(text, voiceId, language) {
   const filepath = path.join(AUDIO_STORAGE_DIR, filename);
   fs.writeFileSync(filepath, audioBuffer);
   recordVoiceMetric('tts_audio_written', { voiceId, language, modelId: model, bytes: audioBuffer.length, storageDir: AUDIO_STORAGE_DIR });
-  return { audioUrl: `${AUDIO_PUBLIC_PATH}/${filename}`, voiceId, modelId: model };
+  return { audioUrl: `${AUDIO_PUBLIC_PATH}/${filename}`, voiceId, modelId: model, localFilePath: filepath };
 }
 
 // ── Onboarding endpoint ─────────────────────────────────────────────
@@ -853,6 +898,36 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
       console.log('Using question audio for cloning (no dedicated sample)');
     }
 
+    // ── Capa 1: pre-clone audio quality detector ─────────────────────
+    // Reject too-short or silent uploads BEFORE we burn an ElevenLabs clone
+    // call. Failure-soft if the decoder isn't available — better some clones
+    // than none. See backend/voice_validator.js + Build 51 Sentry regression.
+    if (combinedVoicePath) {
+      Sentry.setTag('voice_validator_step', 'pre_clone');
+      const v1 = await voiceValidator.validateInputSample(combinedVoicePath);
+      if (!v1.ok) {
+        Sentry.captureMessage('voice_validator.pre_clone_rejected', {
+          level: 'warning',
+          tags: { component: 'voice_validator', step: 'pre_clone', code: v1.code },
+          extra: { duration: v1.duration, peak: v1.peak, file: path.basename(combinedVoicePath) },
+        });
+        // Clean up uploaded files since we are aborting.
+        const cleanup = [...audioFiles, combinedVoicePath].filter(Boolean);
+        cleanup.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });
+        return res.status(v1.http || 400).json({
+          error: v1.message,
+          code: v1.code,
+          voiceValidator: { step: 'pre_clone', duration: v1.duration, peak: v1.peak },
+        });
+      }
+      Sentry.addBreadcrumb({
+        category: 'voice_validator',
+        level: 'info',
+        message: 'pre_clone_passed',
+        data: { duration: v1.duration, peak: v1.peak, soft: !!v1.soft, reason: v1.reason || null },
+      });
+    }
+
     let voiceReady = !!((audioFiles.length > 0 || combinedVoicePath) && ELEVENLABS_API_KEY);
 
     const sessionId = Date.now().toString();
@@ -961,13 +1036,25 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
         recordVoiceMetric('stale_cached_voice_cleared', { userId: authedUser.id, voiceId: cachedVoiceId, endpoint: 'generate_affirmation' });
       }
       // Do NOT delete voicePath — daily affirmations need the same sample.
+
+      // Capa 2 surfaced a glitched clone — return 502 so the app can prompt
+      // the user to retry with a clearer recording. Falling back to a preset
+      // voice here would lie ("your voice" but it isn't), so we error.
+      if (cloneResult.voiceDebug?.errorCode === 'VOICE_CLONE_GLITCHED') {
+        return res.status(cloneResult.voiceDebug.errorHttp || 502).json({
+          error: cloneResult.voiceDebug.errorMessage,
+          code: 'VOICE_CLONE_GLITCHED',
+          voiceDebug: cloneResult.voiceDebug,
+        });
+      }
     } else {
       const fallbackResult = await textToSpeechFallback(affirmationText, gender, language);
       audioUrl = fallbackResult.audioUrl;
       voiceDebug = fallbackResult.voiceDebug;
     }
 
-    res.json({ affirmationText, audioUrl, voiceDebug });
+    const cloneVerified = voiceDebug?.cloneVerified === true;
+    res.json({ affirmationText, audioUrl, voiceDebug, clone_verified: cloneVerified });
   } catch (err) {
     Sentry.captureException(err, {
       tags: { area: 'voice_clone', endpoint: 'generate_affirmation' },

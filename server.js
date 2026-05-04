@@ -337,16 +337,28 @@ const upload = multer({
 });
 
 // OpenAI client
+// 2026-05-04: lazy + DeepSeek-or-OpenAI auto-detect.
+// Prefers DEEPSEEK_API_KEY (cheaper, OpenAI-compatible). Falls back to OPENAI_API_KEY.
 let _openai = null;
 const openai = new Proxy({}, {
   get(_t, prop) {
     if (!_openai) {
-      if (!process.env.OPENAI_API_KEY) {
-        const err = new Error("OPENAI_API_KEY not set");
+      const dsk = process.env.DEEPSEEK_API_KEY;
+      const oak = process.env.OPENAI_API_KEY;
+      if (dsk) {
+        _openai = new OpenAI({
+          apiKey: dsk,
+          baseURL: process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1"
+        });
+        console.log("OpenAI client → DeepSeek (cost-optimized)");
+      } else if (oak) {
+        _openai = new OpenAI({ apiKey: oak });
+        console.log("OpenAI client → OpenAI");
+      } else {
+        const err = new Error("Neither DEEPSEEK_API_KEY nor OPENAI_API_KEY is set");
         err.code = "OPENAI_KEY_MISSING";
         throw err;
       }
-      _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     }
     const v = _openai[prop];
     return typeof v === "function" ? v.bind(_openai) : v;

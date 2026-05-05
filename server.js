@@ -1,12 +1,34 @@
 require("dotenv").config();
 const Sentry = require("@sentry/node");
+
+// ── F4 Sentry Full — backend canonical init ──
+const _pkg = (() => { try { return require("./package.json"); } catch (e) { return {}; } })();
+const _version = _pkg.version || "0.0.0";
+const _commit = process.env.GIT_COMMIT || process.env.RAILWAY_GIT_COMMIT_SHA || "local";
+const _release = `alzo-backend@${_version}-${_commit.slice(0, 7)}`;
+const _env = process.env.NODE_ENV || "production";
+const _isProd = _env === "production";
+
 Sentry.init({
   dsn: process.env.SENTRY_DSN || "",
   enabled: !!process.env.SENTRY_DSN,
-  environment: process.env.NODE_ENV || "production",
+  environment: _env,
+  release: _release,
   serverName: "alzo-backend",
-  tracesSampleRate: 0.1,
+  tracesSampleRate: _isProd ? 0.2 : 1.0,
+  integrations: [
+    Sentry.httpIntegration({ tracing: true }),
+    Sentry.expressIntegration(),
+  ],
 });
+
+// Tag every backend event with platform=node + release.
+try {
+  Sentry.setTag("platform", "node");
+  Sentry.setTag("release", _release);
+  Sentry.setTag("environment", _env);
+} catch (e) {}
+
 const express = require("express");
 const multer = require("multer");
 const path = require("path");

@@ -1543,7 +1543,48 @@ const handleDeleteAccount = async (req, res) => {
     }
   }
 
-  // 2) + 3) Cascade DB delete inside a transaction. Order matters because
+  // 2) ElevenLabs voice cleanup — best-effort, never blocks DB cascade.
+  //    Path C (Joaquín 2026-05-09): the previous "cascade fix" referenced
+  //    commit 4965746 was never actually written. This adds the missing API
+  //    call so a deleted account also removes its cloned voice from
+  //    ElevenLabs (frees the slot + closes the privacy gap).
+  if (user.elevenlabsVoiceId && ELEVENLABS_API_KEY) {
+    try {
+      const elDelRes = await withTimeout(
+        fetch(`${ELEVENLABS_BASE}/voices/${user.elevenlabsVoiceId}`, {
+          method: "DELETE",
+          headers: { "xi-api-key": ELEVENLABS_API_KEY },
+        }),
+        8000,
+      );
+      const ok = !!(elDelRes && elDelRes.ok);
+      Sentry.addBreadcrumb({
+        category: "elevenlabs.delete",
+        level: ok ? "info" : "warning",
+        message: "delete_account.elevenlabs_voice_deleted",
+        data: { voice_id: user.elevenlabsVoiceId, status: elDelRes && elDelRes.status, ok },
+      });
+      if (!ok) {
+        Sentry.captureMessage("delete_account.elevenlabs_voice_delete_failed", {
+          level: "warning",
+          tags: { flow: "delete_account", step: "elevenlabs_delete" },
+          extra: {
+            userId: user.id,
+            voiceId: user.elevenlabsVoiceId,
+            status: elDelRes && elDelRes.status,
+          },
+        });
+      }
+    } catch (e) {
+      // Network/timeout/etc — best-effort. Do NOT block DB cascade.
+      Sentry.captureException(e, {
+        tags: { flow: "delete_account", step: "elevenlabs_delete" },
+        extra: { userId: user.id, voiceId: user.elevenlabsVoiceId },
+      });
+    }
+  }
+
+  // 3) + 4) Cascade DB delete inside a transaction.
   //    PRAGMA foreign_keys is now ON (see init): rows that are referenced by
   //    other rows must go last. Deletion order, child → parent:
   //      checkins (refs goals)            → must precede goals

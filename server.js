@@ -422,6 +422,53 @@ const WHISPER_LANGUAGE = {
   'es-ES': 'es',
 };
 
+// 2026-05-10 (Joaquín #alzo-dev2 14:59 EDT): defensive guard — prevent
+// thinking-mode regressions (DeepSeek-v4-pro/flash, Qwen3) where message.content
+// is empty because output went to reasoning_content, leading to 0.6s TTS,
+// clone_glitched and orphan voice. Validate, retry once, fall back to a safe
+// deterministic text long enough to pass the 4s TTS validator.
+const AFFIRMATION_FALLBACK = (
+  "You wake up. You move. You build what you said you would. " +
+  "This week, the work continues. You don’t quit. Now go."
+);
+const AFFIRMATION_MIN_CHARS = 50;
+const AFFIRMATION_MIN_WORDS = 8;
+const AFFIRMATION_MIN_SENTENCES = 1;
+
+function _validateAffirmationResponse(resp, model, retry_used) {
+  const msg = (resp && resp.choices && resp.choices[0] && resp.choices[0].message) || {};
+  const content = (msg.content || "").trim();
+  const reasoning = (msg.reasoning_content || msg.reasoning || "").trim();
+  const word_count = content ? content.split(/\s+/).filter(Boolean).length : 0;
+  const sentence_count = (content.match(/[.!?]+/g) || []).length;
+
+  let validation_result = "pass";
+  if (!content) validation_result = "fail_empty";
+  else if (word_count < AFFIRMATION_MIN_WORDS) validation_result = "fail_too_short_words";
+  else if (content.length < AFFIRMATION_MIN_CHARS) validation_result = "fail_too_short_chars";
+  else if (sentence_count < AFFIRMATION_MIN_SENTENCES) validation_result = "fail_no_sentences";
+
+  recordVoiceMetric("generate_affirmation", {
+    model_used: model,
+    content_length: content.length,
+    reasoning_length: reasoning.length,
+    word_count,
+    sentence_count,
+    retry_used,
+    fallback_used: false,
+    validation_result,
+  });
+
+  return {
+    ok: validation_result === "pass",
+    text: content,
+    validation_result,
+    word_count,
+    content_length: content.length,
+    reasoning_length: reasoning.length,
+  };
+}
+
 async function generateAffirmation(context, language) {
   const { goal, goal90, mood, intro, weekGoal, bigGoal, whyItMatters, weeklyGoal, weekFocus, identity, blocker, vision, strength } = context;
 
@@ -438,13 +485,7 @@ async function generateAffirmation(context, language) {
   // Default to English — never auto-detect from context
   const langInstruction = LANGUAGE_INSTRUCTIONS[language] || LANGUAGE_INSTRUCTIONS['en-US'];
 
-  const response = await openai.chat.completions.create({
-    model: _DEFAULT_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          `You are a FIRE personal coach writing a 10-15 second POWER affirmation for ALZO. It plays in the user's cloned voice every morning. It must hit like a punch — short, raw, electric.
+  const systemPrompt = `You are a FIRE personal coach writing a 10-15 second POWER affirmation for ALZO. It plays in the user's cloned voice every morning. It must hit like a punch — short, raw, electric.
 
 YOUR JOB: Make them feel UNSTOPPABLE in under 30 words. No filler. No fluff. Every word earns its place.
 
@@ -480,11 +521,9 @@ HARD RULES:
 - Fix brand names: "also" = "ALZO"
 - NEVER: universe, manifest, journey, abundance, vibration, greatness, pushing
 
-CRITICAL LANGUAGE RULE: ${langInstruction} This is non-negotiable.`,
-      },
-      {
-        role: "user",
-        content: `Generate the daily affirmation.
+CRITICAL LANGUAGE RULE: ${langInstruction} This is non-negotiable.`;
+
+  const userPrompt = `Generate the daily affirmation.
 
 Context:
 ${contextBlock}
@@ -492,14 +531,87 @@ ${contextBlock}
 Mood today: ${mood || "default"}
 
 Output only the affirmation text. No quotes, no labels, no explanations.
-Language: ${langInstruction}`,
-      },
-    ],
-    temperature: 0.85,
-    max_tokens: 500,
-  });
+Language: ${langInstruction}`;
 
-  return response.choices[0].message.content.trim();
+  // ─── Attempt 1: standard call ──────────────────────────────────────
+  let resp1;
+  try {
+    resp1 = await openai.chat.completions.create({
+      model: _DEFAULT_MODEL,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0.85,
+      max_tokens: 500,
+    });
+  } catch (e) {
+    Sentry.captureException(e, {
+      tags: { area: "affirmation", attempt: "1", model: _DEFAULT_MODEL },
+    });
+    resp1 = null;
+  }
+  const v1 = _validateAffirmationResponse(resp1, _DEFAULT_MODEL, false);
+  if (v1.ok) return v1.text;
+
+  // ─── Attempt 2: stricter prompt + lower temperature ────────────────
+  Sentry.addBreadcrumb({
+    category: "affirmation",
+    level: "warning",
+    message: "affirmation_validation_failed_retry",
+    data: {
+      reason: v1.validation_result,
+      content_length: v1.content_length,
+      word_count: v1.word_count,
+      reasoning_length: v1.reasoning_length,
+      model: _DEFAULT_MODEL,
+    },
+  });
+  const strictUser = `${userPrompt}
+
+IMPORTANT: Return the affirmation as PLAIN TEXT in the assistant message content. Do NOT return reasoning, thinking, JSON, code blocks, or empty content. Minimum 12 words across at least 2 short sentences.`;
+  let resp2;
+  try {
+    resp2 = await openai.chat.completions.create({
+      model: _DEFAULT_MODEL,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: strictUser },
+      ],
+      temperature: 0.5,
+      max_tokens: 500,
+    });
+  } catch (e) {
+    Sentry.captureException(e, {
+      tags: { area: "affirmation", attempt: "2", model: _DEFAULT_MODEL },
+    });
+    resp2 = null;
+  }
+  const v2 = _validateAffirmationResponse(resp2, _DEFAULT_MODEL, true);
+  if (v2.ok) return v2.text;
+
+  // ─── Fallback: deterministic safe text long enough for TTS validator ─
+  Sentry.captureMessage("affirmation.fallback_used", {
+    level: "warning",
+    tags: { area: "affirmation", step: "fallback", model: _DEFAULT_MODEL },
+    extra: {
+      attempt1_result: v1.validation_result,
+      attempt2_result: v2.validation_result,
+      attempt1_reasoning_length: v1.reasoning_length,
+      attempt2_reasoning_length: v2.reasoning_length,
+    },
+  });
+  recordVoiceMetric("generate_affirmation", {
+    model_used: _DEFAULT_MODEL,
+    content_length: AFFIRMATION_FALLBACK.length,
+    reasoning_length: 0,
+    word_count: AFFIRMATION_FALLBACK.split(/\s+/).filter(Boolean).length,
+    sentence_count: (AFFIRMATION_FALLBACK.match(/[.!?]+/g) || []).length,
+    retry_used: true,
+    fallback_used: true,
+    validation_result: "fallback",
+  });
+  return AFFIRMATION_FALLBACK;
 }
 
 // ── ElevenLabs: clone voice and generate audio ───────────────────────

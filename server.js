@@ -1455,8 +1455,16 @@ app.get("/api/subscription/status", (req, res) => {
 
   // QA seed users — bypass subscription check so Maestro flows do not
   // depend on a live Stripe trial. Matches qa-seed@... and qa-seed-*@...
-  // under @thenetmencorp.com only; real users cannot trigger this branch.
-  if (user.email && /^qa-seed(-[a-z0-9-]+)?@thenetmencorp\.com$/i.test(user.email)) {
+  // under @thenetmencorp.com only. Exit plan: hard-expires on 2026-08-01
+  // to force a permanent fix (Stripe trial-refresh cron). See
+  // vault/decisions/2026-05-12-qa-seed-bypass-server.md.
+  if (
+    user.email &&
+    /^qa-seed(-[a-z0-9-]+)?@thenetmencorp\.com$/i.test(user.email) &&
+    Date.now() < Date.parse("2026-08-01T00:00:00Z")
+  ) {
+    Sentry.addBreadcrumb({ category: "qa", message: "qa_bypass hit", level: "info", data: { email: user.email, endpoint: "/api/subscription/status" } });
+    Sentry.setTag("qa_bypass", true);
     return res.json({ hasAccess: true, status: "qa_bypass", inTrial: false, trialEndsAt: null, subscriptionCurrentPeriodEnd: null });
   }
 

@@ -1453,6 +1453,13 @@ app.get("/api/subscription/status", (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
+  // QA seed users — bypass subscription check so Maestro flows do not
+  // depend on a live Stripe trial. Matches qa-seed@... and qa-seed-*@...
+  // under @thenetmencorp.com only; real users cannot trigger this branch.
+  if (user.email && /^qa-seed(-[a-z0-9-]+)?@thenetmencorp\.com$/i.test(user.email)) {
+    return res.json({ hasAccess: true, status: "qa_bypass", inTrial: false, trialEndsAt: null, subscriptionCurrentPeriodEnd: null });
+  }
+
   const now = Math.floor(Date.now() / 1000);
   const status = user.subscriptionStatus || "none";
   const inTrial = user.trialEndsAt && now < user.trialEndsAt;

@@ -1420,12 +1420,53 @@ app.post(
         case "customer.subscription.updated":
         case "customer.subscription.created": {
           const sub = event.data.object;
-          stmts.setSubscriptionByCustomerId.run(
+          const upd = stmts.setSubscriptionByCustomerId.run(
             sub.id,
             sub.status,
             sub.current_period_end,
             sub.customer,
           );
+          if (upd.changes === 0) {
+            // Fallback: customer was created out-of-band (e.g. via API, not checkout flow).
+            // Match user by normalized email; fail closed on duplicates.
+            try {
+              const customer = await stripe.customers.retrieve(sub.customer);
+              const email = (customer && customer.email ? String(customer.email).trim().toLowerCase() : "");
+              if (email) {
+                const matches = db.prepare("SELECT id FROM users WHERE LOWER(TRIM(email)) = ?").all(email);
+                if (matches.length === 1) {
+                  const userId = matches[0].id;
+                  stmts.setStripeCustomer.run(sub.customer, userId);
+                  stmts.setSubscriptionByCustomerId.run(
+                    sub.id,
+                    sub.status,
+                    sub.current_period_end,
+                    sub.customer,
+                  );
+                  Sentry.addBreadcrumb({
+                    category: "stripe.webhook",
+                    level: "info",
+                    message: "webhook.fallback_by_email.linked",
+                    data: { email, userId, customerId: sub.customer, subscriptionId: sub.id, eventType: event.type },
+                  });
+                } else if (matches.length > 1) {
+                  Sentry.captureMessage("stripe.webhook.fallback_by_email.duplicate", {
+                    level: "error",
+                    extra: { email, customerId: sub.customer, count: matches.length, eventType: event.type },
+                  });
+                } else {
+                  Sentry.addBreadcrumb({
+                    category: "stripe.webhook",
+                    level: "warning",
+                    message: "webhook.fallback_by_email.no_match",
+                    data: { email, customerId: sub.customer, eventType: event.type },
+                  });
+                }
+              }
+            } catch (fallbackErr) {
+              Sentry.captureException(fallbackErr, { tags: { source: "stripe.webhook.fallback_by_email" } });
+            }
+          }
           break;
         }
         case "customer.subscription.deleted": {

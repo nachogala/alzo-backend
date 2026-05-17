@@ -22,6 +22,9 @@ const appleSignin = require("apple-signin-auth");
 // audio quality detector. Backs the Sentry `elevenlabs.clone_failed` 46-hit
 // regression observed in Build 51.
 const voiceValidator = require("./backend/voice_validator");
+// qa-mock-tts kill switch: QA/Maestro/internal-build users get a static silent
+// MP3 instead of an ElevenLabs call. Saves quota; see lib/qa-mock-tts.js.
+const qaMockTts = require("./lib/qa-mock-tts");
 
 const app = express();
 const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
@@ -1277,6 +1280,26 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       return res.status(400).json({ error: "Context is required" });
     }
 
+    // ── QA kill switch ────────────────────────────────────────────────
+    // Short-circuit BEFORE generating text + voice for QA/Maestro/internal
+    // users. Saves ElevenLabs quota and OpenAI generation tokens.
+    {
+      const probe = qaMockTts.shouldServeMock(req, getUserByToken(req));
+      if (probe.mock) {
+        const mock = qaMockTts.buildMockResponse({
+          user: getUserByToken(req),
+          reason: probe.reason,
+          affirmationText: "QA mock affirmation — voice path bypassed.",
+        });
+        return res.json({
+          affirmationText: mock.affirmationText,
+          audioUrl: mock.audioUrl,
+          voiceDebug: { cloneMode: mock.cloneMode, fallbackUsed: false, error: null, mockReason: probe.reason },
+          clone_verified: false,
+        });
+      }
+    }
+
     // 1. Generate affirmation text
     const affirmationText = await generateAffirmation(context, language);
 
@@ -1365,6 +1388,31 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
   try {
     const user = getUserByToken(req);
     if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+    // ── QA kill switch ────────────────────────────────────────────────
+    // Short-circuit BEFORE paywall + voice path for QA/Maestro/internal
+    // users. Saves ElevenLabs quota and Stripe-state coupling in tests.
+    {
+      const probe = qaMockTts.shouldServeMock(req, user);
+      if (probe.mock) {
+        const tz = Number.isFinite(req.body?.timezoneOffsetMinutes) ? req.body.timezoneOffsetMinutes : 0;
+        const local = new Date(Date.now() - tz * 60 * 1000);
+        const dateKey = local.toISOString().slice(0, 10);
+        const mock = qaMockTts.buildMockResponse({
+          user,
+          reason: probe.reason,
+          affirmationText: "QA mock affirmation — voice path bypassed.",
+        });
+        return res.json({
+          dateKey,
+          affirmationText: mock.affirmationText,
+          audioUrl: mock.audioUrl,
+          voiceMode: mock.cloneMode,
+          cached: false,
+          mockReason: probe.reason,
+        });
+      }
+    }
 
     // Paywall gate: active subscription OR within trial. Otherwise 402 with
     // a hint for the app to open checkout.

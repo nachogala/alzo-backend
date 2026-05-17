@@ -22,6 +22,9 @@ const appleSignin = require("apple-signin-auth");
 // audio quality detector. Backs the Sentry `elevenlabs.clone_failed` 46-hit
 // regression observed in Build 51.
 const voiceValidator = require("./backend/voice_validator");
+// qa-mock-tts kill switch: QA/Maestro/internal-build users get a static silent
+// MP3 instead of an ElevenLabs call. Saves quota; see lib/qa-mock-tts.js.
+const qaMockTts = require("./lib/qa-mock-tts");
 
 const app = express();
 const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
@@ -218,6 +221,7 @@ const stmts = {
   updatePlan: db.prepare("UPDATE users SET plan = ? WHERE email = ?"),
   updateNotification: db.prepare("UPDATE users SET notificationHour = ?, notificationMinute = ? WHERE id = ?"),
   getVoiceId: db.prepare("SELECT elevenlabsVoiceId FROM users WHERE id = ?"),
+  getAllVoiceIds: db.prepare("SELECT elevenlabsVoiceId FROM users WHERE elevenlabsVoiceId IS NOT NULL"),
   setVoiceId: db.prepare("UPDATE users SET elevenlabsVoiceId = ? WHERE id = ?"),
   getAffirmationByDate: db.prepare("SELECT * FROM affirmations WHERE userId = ? AND dateKey = ?"),
   insertAffirmation: db.prepare("INSERT INTO affirmations (id, userId, dateKey, text, audioUrl, voiceMode) VALUES (?, ?, ?, ?, ?, ?)"),
@@ -623,6 +627,90 @@ function withTimeout(promise, ms) {
   ]);
 }
 
+// INC-V-010: deterministic voice-slot eviction. When the ElevenLabs account
+// is at its custom-voice ceiling, free exactly one slot by deleting the oldest
+// cloned voice that is NOT owned by any ALZO user (orphan QA / abandoned clone).
+// Ownership-based — never evicts a live user's cached voice. Returns true if a
+// slot was freed so the caller can retry the clone.
+function isVoiceLimitError(bodyText, status) {
+  const b = String(bodyText || '').toLowerCase();
+  return (
+    status === 422 || status === 400 ||
+    b.includes('voice_limit') ||
+    b.includes('can_not_use_instant_voice_cloning') ||
+    b.includes('maximum number of') ||
+    b.includes('voice limit') ||
+    b.includes('reached the limit')
+  );
+}
+
+async function evictOldestOrphanVoice() {
+  try {
+    const ownedIds = new Set(
+      stmts.getAllVoiceIds.all().map((r) => r.elevenlabsVoiceId).filter(Boolean),
+    );
+    const listRes = await withTimeout(
+      fetch(`${ELEVENLABS_BASE}/voices`, { headers: { 'xi-api-key': ELEVENLABS_API_KEY } }),
+      15000,
+    );
+    if (!listRes || !listRes.ok) {
+      recordVoiceMetric('slot_eviction_list_failed', {
+        level: 'warning',
+        status: listRes ? listRes.status : 'timeout',
+      });
+      return false;
+    }
+    const { voices = [] } = await listRes.json();
+    // Candidates: cloned voices we created (name prefix alzo_) that no DB user
+    // currently references. Oldest first — name carries the creation epoch
+    // (alzo_<ms>_<hex>); fall back to created_at_unix when present.
+    const candidates = voices
+      .filter((v) => v.category === 'cloned')
+      .filter((v) => !ownedIds.has(v.voice_id))
+      .filter((v) => typeof v.name === 'string' && v.name.startsWith('alzo_'))
+      .map((v) => {
+        const m = /^alzo_(\d+)_/.exec(v.name || '');
+        const ts = m ? Number(m[1]) : (v.created_at_unix ? v.created_at_unix * 1000 : 0);
+        return { voice_id: v.voice_id, name: v.name, ts };
+      })
+      .sort((a, b) => a.ts - b.ts);
+    if (candidates.length === 0) {
+      recordVoiceMetric('slot_eviction_no_candidate', {
+        level: 'warning',
+        totalVoices: voices.length,
+        ownedCount: ownedIds.size,
+      });
+      return false;
+    }
+    const victim = candidates[0];
+    const delRes = await withTimeout(
+      fetch(`${ELEVENLABS_BASE}/voices/${victim.voice_id}`, {
+        method: 'DELETE',
+        headers: { 'xi-api-key': ELEVENLABS_API_KEY },
+      }),
+      15000,
+    );
+    const ok = !!(delRes && delRes.ok);
+    recordVoiceMetric('slot_evicted', {
+      level: ok ? 'info' : 'warning',
+      voiceId: victim.voice_id,
+      voiceName: victim.name,
+      voiceAgeMs: victim.ts ? Date.now() - victim.ts : null,
+      ok,
+    });
+    Sentry.addBreadcrumb({
+      category: 'elevenlabs.slot_eviction',
+      level: ok ? 'info' : 'warning',
+      message: ok ? 'orphan_voice_evicted' : 'orphan_voice_evict_failed',
+      data: { voiceId: victim.voice_id, voiceName: victim.name },
+    });
+    return ok;
+  } catch (err) {
+    recordVoiceMetric('slot_eviction_error', { level: 'error', error: err.message });
+    return false;
+  }
+}
+
 async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existingVoiceId = null) {
   const voiceFiles = (Array.isArray(voiceFilePath) ? voiceFilePath : [voiceFilePath]).filter(Boolean);
   const debug = {
@@ -710,33 +798,69 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
   }
 
   try {
-    const formData = new FormData();
-    formData.append("name", `alzo_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`);
-    formData.append("description", "ALZO user voice clone for affirmations");
-    // B48-3: clean up sample audio before fingerprinting — kicks clone quality
-    // up materially when source has room tone, breath, fan noise, etc.
-    formData.append("remove_background_noise", "true");
-    if (Array.isArray(voiceFilePath)) {
-      voiceFilePath.forEach((fp, i) => {
-        const buf = fs.readFileSync(fp);
-        formData.append("files", new Blob([buf], { type: "audio/m4a" }), `sample_${i}.m4a`);
-      });
-    } else if (voiceFilePath) {
-      const fileBuffer = fs.readFileSync(voiceFilePath);
-      formData.append("files", new Blob([fileBuffer], { type: "audio/m4a" }), "voice_sample.m4a");
-    }
+    // Rebuildable: FormData wraps single-use streams, so a retry after slot
+    // eviction needs a fresh instance. The clone name carries Date.now() so
+    // eviction ordering (oldest-first) stays meaningful.
+    const cloneVoiceName = `alzo_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+    const buildVoiceFormData = () => {
+      const fd = new FormData();
+      fd.append("name", cloneVoiceName);
+      fd.append("description", "ALZO user voice clone for affirmations");
+      // B48-3: clean up sample audio before fingerprinting — kicks clone quality
+      // up materially when source has room tone, breath, fan noise, etc.
+      fd.append("remove_background_noise", "true");
+      if (Array.isArray(voiceFilePath)) {
+        voiceFilePath.forEach((fp, i) => {
+          const buf = fs.readFileSync(fp);
+          fd.append("files", new Blob([buf], { type: "audio/m4a" }), `sample_${i}.m4a`);
+        });
+      } else if (voiceFilePath) {
+        const fileBuffer = fs.readFileSync(voiceFilePath);
+        fd.append("files", new Blob([fileBuffer], { type: "audio/m4a" }), "voice_sample.m4a");
+      }
+      return fd;
+    };
 
     debug.cloneMode = 'clone_attempted';
     console.log('Voice clone samples:', debug.sampleFiles);
 
-    const addVoiceRes = await withTimeout(fetch(`${ELEVENLABS_BASE}/voices/add`, {
+    // Wrapped so a provider voice-slot-ceiling rejection can trigger one
+    // deterministic eviction + retry (INC-V-010) before we give up.
+    const doAddVoice = () => withTimeout(fetch(`${ELEVENLABS_BASE}/voices/add`, {
       method: "POST",
       headers: { "xi-api-key": ELEVENLABS_API_KEY },
-      body: formData,
+      // formData is a single-use stream; rebuild on retry.
+      body: buildVoiceFormData(),
     }), 25000);
 
+    let addVoiceRes = await doAddVoice();
+    let addErrorText = null;
     if (!addVoiceRes || !addVoiceRes.ok) {
-      const errorText = addVoiceRes ? await addVoiceRes.text() : 'timeout adding voice';
+      addErrorText = addVoiceRes ? await addVoiceRes.text() : 'timeout adding voice';
+      const addStatus = addVoiceRes ? addVoiceRes.status : null;
+      // INC-V-010: at the account voice-slot ceiling — evict the oldest orphan
+      // QA / non-owner clone, then retry the add exactly once.
+      if (addStatus && isVoiceLimitError(addErrorText, addStatus)) {
+        debug.slotCeilingHit = true;
+        recordVoiceMetric('voice_slot_ceiling', {
+          level: 'warning', status: addStatus,
+          body: String(addErrorText).slice(0, 300),
+        });
+        const freed = await evictOldestOrphanVoice();
+        debug.slotEvicted = freed;
+        if (freed) {
+          addVoiceRes = await doAddVoice();
+          if (addVoiceRes && addVoiceRes.ok) {
+            addErrorText = null;
+          } else {
+            addErrorText = addVoiceRes ? await addVoiceRes.text() : 'timeout adding voice (post-eviction)';
+          }
+        }
+      }
+    }
+
+    if (!addVoiceRes || !addVoiceRes.ok) {
+      const errorText = addErrorText || 'timeout adding voice';
       console.error("Voice clone failed:", errorText);
       debug.cloneMode = 'clone_failed';
       debug.error = errorText;
@@ -745,12 +869,17 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
         category: 'elevenlabs.clone',
         level: 'error',
         message: 'clone_failed',
-        data: { status: addVoiceRes ? addVoiceRes.status : 'timeout', body: String(errorText).slice(0, 500) },
+        data: { status: addVoiceRes ? addVoiceRes.status : 'timeout', body: String(errorText).slice(0, 500), slotEvicted: debug.slotEvicted },
       });
+      // (c) voice_error_class: timeout = no response; otherwise bucket the
+      // provider HTTP status into 4xx / 5xx.
+      const clf_status = addVoiceRes ? addVoiceRes.status : null;
+      const voiceErrorClass = !clf_status ? 'timeout'
+        : (clf_status >= 500 ? '5xx' : (clf_status >= 400 ? '4xx' : '5xx'));
       Sentry.captureMessage('elevenlabs.clone_failed', {
         level: 'warning',
-        tags: { component: 'elevenlabs', cloneMode: 'clone_failed' },
-        extra: { errorBody: String(errorText).slice(0, 500) },
+        tags: { component: 'elevenlabs', cloneMode: 'clone_failed', voice_error_class: voiceErrorClass },
+        extra: { errorBody: String(errorText).slice(0, 500), slotCeilingHit: !!debug.slotCeilingHit, slotEvicted: !!debug.slotEvicted, providerStatus: clf_status },
       });
       return { audioUrl: null, voiceDebug: debug, voiceId: null };
     }
@@ -773,9 +902,12 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
         message: 'tts_failed_after_clone',
         data: { voiceId: voice_id, language },
       });
+      // (c) voice_error_class: generateSpeech wrapped in withTimeout — a null
+      // result means the 30s race elapsed (timeout). A thrown provider error is
+      // handled in the catch below; here null === timeout.
       Sentry.captureMessage('elevenlabs.tts_failed_after_clone', {
         level: 'warning',
-        tags: { component: 'elevenlabs', cloneMode: 'tts_failed_after_clone' },
+        tags: { component: 'elevenlabs', cloneMode: 'tts_failed_after_clone', voice_error_class: 'timeout' },
         extra: { voiceId: voice_id, language },
       });
       return { audioUrl: null, voiceDebug: debug, voiceId: null };
@@ -831,6 +963,15 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
     debug.cloneMode = 'clone_error';
     debug.error = err.message;
     debug.fallbackBlocked = true;
+    // (c) voice_error_class: classify the thrown provider error. generateSpeech
+    // attaches err.status on non-ok responses; absence => network/timeout.
+    const ce_status = err && err.status;
+    const ceErrorClass = !ce_status ? 'timeout'
+      : (ce_status >= 500 ? '5xx' : (ce_status >= 400 ? '4xx' : '5xx'));
+    Sentry.captureException(err, {
+      tags: { component: 'elevenlabs', cloneMode: 'clone_error', voice_error_class: ceErrorClass },
+      extra: { providerStatus: ce_status || null, body: err && err.body ? String(err.body).slice(0, 500) : null },
+    });
     return { audioUrl: null, voiceDebug: debug, voiceId: null };
   }
 }
@@ -1139,6 +1280,26 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       return res.status(400).json({ error: "Context is required" });
     }
 
+    // ── QA kill switch ────────────────────────────────────────────────
+    // Short-circuit BEFORE generating text + voice for QA/Maestro/internal
+    // users. Saves ElevenLabs quota and OpenAI generation tokens.
+    {
+      const probe = qaMockTts.shouldServeMock(req, getUserByToken(req));
+      if (probe.mock) {
+        const mock = qaMockTts.buildMockResponse({
+          user: getUserByToken(req),
+          reason: probe.reason,
+          affirmationText: "QA mock affirmation — voice path bypassed.",
+        });
+        return res.json({
+          affirmationText: mock.affirmationText,
+          audioUrl: mock.audioUrl,
+          voiceDebug: { cloneMode: mock.cloneMode, fallbackUsed: false, error: null, mockReason: probe.reason },
+          clone_verified: false,
+        });
+      }
+    }
+
     // 1. Generate affirmation text
     const affirmationText = await generateAffirmation(context, language);
 
@@ -1195,6 +1356,17 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       voiceDebug = fallbackResult.voiceDebug;
     }
 
+    // INC-V fix: clone path can resolve audioUrl=null (clone_failed,
+    // tts_failed_*, clone_error, stale-with-no-sample) WITHOUT throwing and
+    // WITHOUT being a hard VOICE_CLONE_GLITCHED 502. Without this guard the
+    // app receives audioUrl:null and the value moment dies silently. Mirrors
+    // the guard on /api/affirmation/today (~line 1298).
+    if (!audioUrl) {
+      const fb = await textToSpeechFallback(affirmationText, gender, language);
+      audioUrl = fb.audioUrl;
+      voiceDebug = fb.voiceDebug;
+    }
+
     const cloneVerified = voiceDebug?.cloneVerified === true;
     res.json({ affirmationText, audioUrl, voiceDebug, clone_verified: cloneVerified });
   } catch (err) {
@@ -1216,6 +1388,31 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
   try {
     const user = getUserByToken(req);
     if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+    // ── QA kill switch ────────────────────────────────────────────────
+    // Short-circuit BEFORE paywall + voice path for QA/Maestro/internal
+    // users. Saves ElevenLabs quota and Stripe-state coupling in tests.
+    {
+      const probe = qaMockTts.shouldServeMock(req, user);
+      if (probe.mock) {
+        const tz = Number.isFinite(req.body?.timezoneOffsetMinutes) ? req.body.timezoneOffsetMinutes : 0;
+        const local = new Date(Date.now() - tz * 60 * 1000);
+        const dateKey = local.toISOString().slice(0, 10);
+        const mock = qaMockTts.buildMockResponse({
+          user,
+          reason: probe.reason,
+          affirmationText: "QA mock affirmation — voice path bypassed.",
+        });
+        return res.json({
+          dateKey,
+          affirmationText: mock.affirmationText,
+          audioUrl: mock.audioUrl,
+          voiceMode: mock.cloneMode,
+          cached: false,
+          mockReason: probe.reason,
+        });
+      }
+    }
 
     // Paywall gate: active subscription OR within trial. Otherwise 402 with
     // a hint for the app to open checkout.

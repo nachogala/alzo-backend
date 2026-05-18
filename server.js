@@ -1560,10 +1560,14 @@ app.post("/api/stripe/create-checkout-session", express.json(), async (req, res)
       mode: "subscription",
       payment_method_types: ["card"],
       line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
-      subscription_data: {
-        trial_period_days: TRIAL_DAYS,
-        metadata: { alzoUserId: user.id },
-      },
+      subscription_data: TRIAL_DAYS > 0
+        ? {
+            trial_period_days: TRIAL_DAYS,
+            metadata: { alzoUserId: user.id },
+          }
+        : {
+            metadata: { alzoUserId: user.id },
+          },
       success_url: `${APP_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${APP_URL}/subscription/cancel`,
       allow_promotion_codes: true,

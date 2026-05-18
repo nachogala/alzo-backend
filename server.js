@@ -25,6 +25,10 @@ const voiceValidator = require("./backend/voice_validator");
 // qa-mock-tts kill switch: QA/Maestro/internal-build users get a static silent
 // MP3 instead of an ElevenLabs call. Saves quota; see lib/qa-mock-tts.js.
 const qaMockTts = require("./lib/qa-mock-tts");
+// P0 (B53 REVENUE BLINDNESS): 6-event funnel helper. logEvent fires stdout +
+// Sentry breadcrumb + (for revenue-critical names) Sentry captureMessage.
+// See vault audits/2026-05-18-alzo-p0-analytics-observability.md.
+const { logEvent: logAnalyticsEvent } = require("./lib/analytics-events");
 
 const app = express();
 const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
@@ -1611,6 +1615,25 @@ app.post(
               sub.current_period_end,
               customerId,
             );
+            // P0 REVENUE BLINDNESS — funnel events #4 + #5
+            // checkout.session.completed is the moment Stripe confirms the
+            // first payment for a checkout flow, so we treat it as both
+            // purchase_success AND the entitlement transition (none|trial → active).
+            const row = stmts.getUserByStripeCustomer.get(customerId);
+            const uid = row && row.id ? row.id : null;
+            logAnalyticsEvent("purchase_success", {
+              source: "stripe.webhook.checkout_completed",
+              customer_id: customerId,
+              subscription_id: subscriptionId,
+              status: sub.status,
+              current_period_end: sub.current_period_end,
+            }, uid);
+            logAnalyticsEvent("entitlement_changed", {
+              source: "stripe.webhook.checkout_completed",
+              customer_id: customerId,
+              subscription_id: subscriptionId,
+              new_status: sub.status,
+            }, uid);
           }
           break;
         }
@@ -1623,6 +1646,21 @@ app.post(
             sub.current_period_end,
             sub.customer,
           );
+          // P0 REVENUE BLINDNESS — funnel event #5 (entitlement_changed)
+          // Fires for any Stripe-side subscription mutation (trial→active,
+          // active→past_due, plan upgrade/downgrade, etc.). The fallback-by-
+          // email branch below re-resolves the user id and we log there too if
+          // needed; this top-level emit covers the happy path where the
+          // customer↔user link already exists.
+          const _entRow = stmts.getUserByStripeCustomer.get(sub.customer);
+          logAnalyticsEvent("entitlement_changed", {
+            source: "stripe.webhook." + event.type,
+            customer_id: sub.customer,
+            subscription_id: sub.id,
+            new_status: sub.status,
+            current_period_end: sub.current_period_end,
+            updated_changes: upd.changes,
+          }, _entRow && _entRow.id ? _entRow.id : null);
           if (upd.changes === 0) {
             // Fallback: customer was created out-of-band (e.g. via API, not checkout flow).
             // Match user by normalized email; fail closed on duplicates.
@@ -1674,6 +1712,14 @@ app.post(
             sub.current_period_end,
             sub.customer,
           );
+          // P0 REVENUE BLINDNESS — funnel event #5 (entitlement_changed → canceled)
+          const _delRow = stmts.getUserByStripeCustomer.get(sub.customer);
+          logAnalyticsEvent("entitlement_changed", {
+            source: "stripe.webhook.subscription_deleted",
+            customer_id: sub.customer,
+            subscription_id: sub.id,
+            new_status: "canceled",
+          }, _delRow && _delRow.id ? _delRow.id : null);
           break;
         }
       }
@@ -1733,6 +1779,9 @@ app.post("/api/auth/signup", (req, res) => {
   // Grant free trial so the user can use the app for TRIAL_DAYS before paywall kicks in.
   const trialEndsAt = Math.floor(Date.now() / 1000) + TRIAL_DAYS * 86400;
   stmts.setTrial.run(trialEndsAt, userId);
+
+  // P0 REVENUE BLINDNESS — funnel event #1
+  logAnalyticsEvent("signup", { provider: "email", trial_ends_at: trialEndsAt }, userId);
 
   res.json({ token, userId, trialEndsAt });
 });
@@ -1796,6 +1845,8 @@ app.post("/api/auth/apple", async (req, res) => {
   const userId = crypto.randomBytes(16).toString("hex");
   const name = fullName || null;
   stmts.insert.run(userId, email, name, "apple_sso_" + appleSub, token);
+  // P0 REVENUE BLINDNESS — funnel event #1 (Apple SSO new user)
+  logAnalyticsEvent("signup", { provider: "apple" }, userId);
   res.json({ token, userId, isNewUser: true });
 });
 
@@ -1836,6 +1887,8 @@ app.post("/api/auth/google", async (req, res) => {
   const userId = crypto.randomBytes(16).toString("hex");
   const name = providedName || null;
   stmts.insert.run(userId, email, name, "google_sso_" + googleSub, token);
+  // P0 REVENUE BLINDNESS — funnel event #1 (Google SSO new user)
+  logAnalyticsEvent("signup", { provider: "google" }, userId);
   res.json({ token, userId, isNewUser: true });
 });
 
@@ -1983,6 +2036,17 @@ const handleDeleteAccount = async (req, res) => {
     });
     return res.status(500).json({ error: "Account deletion failed" });
   }
+
+  // P0 REVENUE BLINDNESS — funnel event #6 (delete_account success).
+  // Fires only on the success path (the 500 above returns before this line),
+  // so any "delete_account" event in the log is by definition a completed
+  // cascade. Payload includes whether the user had an active sub at delete
+  // time so we can measure churn vs free-tier delete.
+  logAnalyticsEvent("delete_account", {
+    had_subscription: !!user.stripeSubscriptionId,
+    previous_status: user.subscriptionStatus || "none",
+    had_voice: !!user.elevenlabsVoiceId,
+  }, user.id);
 
   res.json({ success: true });
 };

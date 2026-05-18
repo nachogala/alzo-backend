@@ -1555,15 +1555,19 @@ app.post("/api/stripe/create-checkout-session", express.json(), async (req, res)
       stmts.setStripeCustomer.run(customerId, user.id);
     }
 
+    const subscriptionData = {
+      metadata: { alzoUserId: user.id },
+    };
+    if (TRIAL_DAYS > 0) {
+      subscriptionData.trial_period_days = TRIAL_DAYS;
+    }
+
     const session = await stripe.checkout.sessions.create({
       customer: customerId,
       mode: "subscription",
       payment_method_types: ["card"],
       line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
-      subscription_data: {
-        trial_period_days: TRIAL_DAYS,
-        metadata: { alzoUserId: user.id },
-      },
+      subscription_data: subscriptionData,
       success_url: `${APP_URL}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${APP_URL}/subscription/cancel`,
       allow_promotion_codes: true,

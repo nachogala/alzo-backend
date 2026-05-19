@@ -2062,23 +2062,39 @@ app.post("/api/subscription/cancel", async (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  // Stripe API call — cancel at period end (user keeps access through billing
-  // period). Mirror of handleDeleteAccount pattern (line 1924).
-  if (user.stripeSubscriptionId) {
-    try {
-      if (stripe) {
-        await stripe.subscriptions.update(user.stripeSubscriptionId, {
-          cancel_at_period_end: true,
-        });
-      }
-    } catch (e) {
-      // Best-effort — don't block the local DB update. Log to Sentry.
-      console.error("cancel-subscription stripe error:", e.message);
-    }
+  if (!user.stripeSubscriptionId) {
+    return res.status(400).json({ error: "No active subscription found" });
   }
 
-  stmts.updatePlan.run("Cancelled", user.email);
-  res.json({ success: true });
+  if (!stripe) {
+    return res.status(503).json({ error: "Billing is not configured" });
+  }
+
+  try {
+    const subscription = await stripe.subscriptions.update(user.stripeSubscriptionId, {
+      cancel_at_period_end: true,
+    });
+
+    Sentry.addBreadcrumb({
+      category: "billing",
+      level: "info",
+      message: "subscription.cancel_at_period_end_requested",
+      data: { subId: user.stripeSubscriptionId },
+    });
+
+    res.json({
+      success: true,
+      cancelAtPeriodEnd: subscription?.cancel_at_period_end === true,
+      subscriptionStatus: subscription?.status || null,
+    });
+  } catch (e) {
+    console.error("cancel-subscription stripe error:", e.message);
+    Sentry.captureException(e, {
+      tags: { flow: "subscription_cancel", step: "stripe_update" },
+      extra: { userId: user.id, subId: user.stripeSubscriptionId },
+    });
+    res.status(502).json({ error: "Unable to cancel subscription" });
+  }
 });
 
 // ── Demo audio endpoint ─────────────────────────────────────────────

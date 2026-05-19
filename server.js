@@ -2062,23 +2062,52 @@ app.post("/api/subscription/cancel", async (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  // Stripe API call — cancel at period end (user keeps access through billing
-  // period). Mirror of handleDeleteAccount pattern (line 1924).
-  if (user.stripeSubscriptionId) {
-    try {
-      if (stripe) {
-        await stripe.subscriptions.update(user.stripeSubscriptionId, {
-          cancel_at_period_end: true,
-        });
-      }
-    } catch (e) {
-      // Best-effort — don't block the local DB update. Log to Sentry.
-      console.error("cancel-subscription stripe error:", e.message);
-    }
+  // Stripe is source of truth. We do NOT mutate local plan here;
+  // the customer.subscription.updated webhook drives entitlement/status.
+  if (!user.stripeSubscriptionId) {
+    return res.status(404).json({ error: "no_active_subscription" });
   }
 
-  stmts.updatePlan.run("Cancelled", user.email);
-  res.json({ success: true });
+  if (!stripe) {
+    Sentry.captureMessage("subscription.cancel.stripe_unavailable", {
+      level: "error",
+      extra: { userId: user.id },
+    });
+    return res.status(502).json({ error: "stripe_unavailable" });
+  }
+
+  try {
+    // Idempotency: if already scheduled for cancel, skip the Stripe call.
+    const current = await stripe.subscriptions.retrieve(user.stripeSubscriptionId);
+    if (current?.cancel_at_period_end === true) {
+      return res.json({
+        success: true,
+        already_cancelled: true,
+        cancel_at_period_end: true,
+        current_period_end: current.current_period_end,
+      });
+    }
+
+    const sub = await stripe.subscriptions.update(user.stripeSubscriptionId, {
+      cancel_at_period_end: true,
+    });
+    Sentry.addBreadcrumb({
+      category: "subscription",
+      message: "subscription.cancel.scheduled",
+      data: { subId: user.stripeSubscriptionId, cancel_at: sub.cancel_at },
+    });
+    return res.json({
+      success: true,
+      cancel_at_period_end: sub.cancel_at_period_end,
+      current_period_end: sub.current_period_end,
+    });
+  } catch (e) {
+    Sentry.captureException(e, {
+      tags: { endpoint: "subscription.cancel" },
+      extra: { userId: user.id, subId: user.stripeSubscriptionId },
+    });
+    return res.status(502).json({ error: "stripe_error", message: e.message });
+  }
 });
 
 // ── Demo audio endpoint ─────────────────────────────────────────────

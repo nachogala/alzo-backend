@@ -2058,9 +2058,25 @@ const handleDeleteAccount = async (req, res) => {
 app.delete("/api/user/me", handleDeleteAccount);
 app.delete("/api/user", handleDeleteAccount);
 
-app.post("/api/subscription/cancel", (req, res) => {
+app.post("/api/subscription/cancel", async (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  // Stripe API call — cancel at period end (user keeps access through billing
+  // period). Mirror of handleDeleteAccount pattern (line 1924).
+  if (user.stripeSubscriptionId) {
+    try {
+      if (stripe) {
+        await stripe.subscriptions.update(user.stripeSubscriptionId, {
+          cancel_at_period_end: true,
+        });
+      }
+    } catch (e) {
+      // Best-effort — don't block the local DB update. Log to Sentry.
+      console.error("cancel-subscription stripe error:", e.message);
+    }
+  }
+
   stmts.updatePlan.run("Cancelled", user.email);
   res.json({ success: true });
 });

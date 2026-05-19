@@ -2077,6 +2077,17 @@ app.post("/api/subscription/cancel", async (req, res) => {
   }
 
   try {
+    // Idempotency: if already scheduled for cancel, skip the Stripe call.
+    const current = await stripe.subscriptions.retrieve(user.stripeSubscriptionId);
+    if (current?.cancel_at_period_end === true) {
+      return res.json({
+        success: true,
+        already_cancelled: true,
+        cancel_at_period_end: true,
+        current_period_end: current.current_period_end,
+      });
+    }
+
     const sub = await stripe.subscriptions.update(user.stripeSubscriptionId, {
       cancel_at_period_end: true,
     });

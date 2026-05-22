@@ -1313,13 +1313,62 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     const manifestPath = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
     const voicePathM4a = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.m4a`);
     const voicePathWebm = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.webm`);
-    const voicePath = fs.existsSync(voicePathM4a) ? voicePathM4a : (fs.existsSync(voicePathWebm) ? voicePathWebm : null);
+    const authedUser = getUserByToken(req);
+    const safeSessionId = String(sessionId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const safeUserId = authedUser?.id ? String(authedUser.id).replace(/[^a-zA-Z0-9_-]/g, '') : null;
+    let voicePath = fs.existsSync(voicePathM4a) ? voicePathM4a : (fs.existsSync(voicePathWebm) ? voicePathWebm : null);
+    const voiceLookup = {
+      method: voicePath ? 'legacy' : null,
+      recoveredFilename: voicePath ? path.basename(voicePath) : null,
+      sessionId,
+      userId: authedUser?.id || null,
+    };
+
+    if (!voicePath && safeSessionId) {
+      try {
+        const entries = fs.readdirSync(UPLOAD_STORAGE_DIR);
+        const sessionScoped = entries
+          .filter((f) => new RegExp(`^voice_${safeSessionId}_\\d+\\.(m4a|webm)$`).test(f))
+          .sort().reverse();
+        if (sessionScoped[0]) {
+          voicePath = path.join(UPLOAD_STORAGE_DIR, sessionScoped[0]);
+          voiceLookup.method = 'sessionScoped';
+          voiceLookup.recoveredFilename = sessionScoped[0];
+        }
+      } catch {}
+      if (!voicePath && safeUserId) {
+        try {
+          const entries = fs.readdirSync(UPLOAD_STORAGE_DIR);
+          const userScoped = entries
+            .filter((f) => f.startsWith(`voice_user_${safeUserId}_${safeSessionId}.`) && /\.(m4a|webm)$/.test(f))
+            .sort().reverse();
+          if (userScoped[0]) {
+            voicePath = path.join(UPLOAD_STORAGE_DIR, userScoped[0]);
+            voiceLookup.method = 'userScopedSession';
+            voiceLookup.recoveredFilename = userScoped[0];
+          }
+        } catch {}
+      }
+      if (!voicePath && safeUserId) {
+        try {
+          const entries = fs.readdirSync(UPLOAD_STORAGE_DIR);
+          const genericUser = entries
+            .filter((f) => f.startsWith(`voice_user_${safeUserId}_`) && /\.(m4a|webm)$/.test(f))
+            .sort().reverse();
+          if (genericUser[0]) {
+            voicePath = path.join(UPLOAD_STORAGE_DIR, genericUser[0]);
+            voiceLookup.method = 'userScopedGeneric';
+            voiceLookup.recoveredFilename = genericUser[0];
+          }
+        } catch {}
+      }
+    }
 
     if (sessionId && voicePath) {
       // Check for a cached ElevenLabs voice_id on the authenticated user.
       // Daily affirmations reuse the cached voice — no re-clone, 1/10th the cost
       // and latency (~3s vs ~25s).
-      const authedUser = getUserByToken(req);
+      console.log('generate-affirmation voice lookup', JSON.stringify(voiceLookup));
       const cachedRow = authedUser ? stmts.getVoiceId.get(authedUser.id) : null;
       const cachedVoiceId = cachedRow?.elevenlabsVoiceId || null;
 
@@ -1335,6 +1384,10 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       const cloneResult = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language, cachedVoiceId);
       audioUrl = cloneResult.audioUrl;
       voiceDebug = cloneResult.voiceDebug;
+      console.log('generate-affirmation voice lookup result', JSON.stringify({
+        ...voiceLookup,
+        cloneMode: voiceDebug?.cloneMode || null,
+      }));
       // Persist the new voice_id so the next affirmation skips the clone step.
       if (authedUser && cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
         stmts.setVoiceId.run(cloneResult.voiceId, authedUser.id);
@@ -1355,9 +1408,14 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
         });
       }
     } else {
+      console.log('generate-affirmation voice lookup', JSON.stringify(voiceLookup));
       const fallbackResult = await textToSpeechFallback(affirmationText, gender, language);
       audioUrl = fallbackResult.audioUrl;
       voiceDebug = fallbackResult.voiceDebug;
+      console.log('generate-affirmation voice lookup result', JSON.stringify({
+        ...voiceLookup,
+        cloneMode: voiceDebug?.cloneMode || null,
+      }));
     }
 
     // INC-V fix: clone path can resolve audioUrl=null (clone_failed,

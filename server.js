@@ -1311,15 +1311,80 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     let audioUrl = null;
     let voiceDebug = { cloneMode: 'not_ready', fallbackUsed: false, error: null };
     const manifestPath = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
-    const voicePathM4a = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.m4a`);
-    const voicePathWebm = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.webm`);
-    const voicePath = fs.existsSync(voicePathM4a) ? voicePathM4a : (fs.existsSync(voicePathWebm) ? voicePathWebm : null);
+
+    // ── Voice-sample lookup cascade ────────────────────────────────────
+    // Onboarding's multi-sample upload persists files under several naming
+    // schemes. Resolving ONLY the legacy single-file path silently dropped
+    // multi-sample users to textToSpeechFallback(). Try, in priority order:
+    //   1. legacy   voice_<sessionId>.{m4a,webm}
+    //   2. sessionScoped  voice_<sessionId>_<N>.{m4a,webm}  (highest N)
+    //   3. userScopedSession  voice_user_<userId>_<sessionId>.{m4a,webm}
+    //   4. userScopedGeneric  voice_user_<userId>_*.{m4a,webm}  (last resort —
+    //      may pick up an OLD sample, so it is logged explicitly).
+    const authedUser = getUserByToken(req);
+    const lookupUserId = authedUser ? authedUser.id : null;
+    const safeUserId = lookupUserId ? String(lookupUserId).replace(/[^a-zA-Z0-9_-]/g, '') : null;
+
+    let voicePath = null;
+    let voiceLookupMethod = 'none';
+    try {
+      const exts = ['m4a', 'webm'];
+      // 1. legacy
+      for (const ext of exts) {
+        const p = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.${ext}`);
+        if (fs.existsSync(p)) { voicePath = p; voiceLookupMethod = 'legacy'; break; }
+      }
+      // 2. sessionScoped multi-sample (highest N / newest)
+      if (!voicePath) {
+        const re = new RegExp(`^voice_${sessionId}_(\\d+)\\.(m4a|webm)$`);
+        const sessionScoped = fs.readdirSync(UPLOAD_STORAGE_DIR)
+          .filter((f) => re.test(f))
+          .sort((a, b) => (parseInt(a.match(re)[1], 10) - parseInt(b.match(re)[1], 10)))
+          .reverse();
+        if (sessionScoped[0]) {
+          voicePath = path.join(UPLOAD_STORAGE_DIR, sessionScoped[0]);
+          voiceLookupMethod = 'sessionScoped';
+        }
+      }
+      // 3. userScopedSession — voice_user_<userId>_<sessionId>.{m4a,webm}
+      if (!voicePath && safeUserId) {
+        for (const ext of exts) {
+          const p = path.join(UPLOAD_STORAGE_DIR, `voice_user_${safeUserId}_${sessionId}.${ext}`);
+          if (fs.existsSync(p)) { voicePath = p; voiceLookupMethod = 'userScopedSession'; break; }
+        }
+      }
+      // 4. userScopedGeneric — last resort, may be an OLD sample
+      if (!voicePath && safeUserId) {
+        const generic = fs.readdirSync(UPLOAD_STORAGE_DIR)
+          .filter((f) => f.startsWith(`voice_user_${safeUserId}_`) && /\.(m4a|webm)$/.test(f))
+          .sort()
+          .reverse();
+        if (generic[0]) {
+          voicePath = path.join(UPLOAD_STORAGE_DIR, generic[0]);
+          voiceLookupMethod = 'userScopedGeneric';
+        }
+      }
+    } catch (lookupErr) {
+      console.error('[generate-affirmation] voice-lookup error:', lookupErr);
+    }
+
+    console.log(`[generate-affirmation] voice-lookup method=${voiceLookupMethod} ` +
+      `file=${voicePath ? path.basename(voicePath) : 'null'} ` +
+      `sessionId=${sessionId} userId=${lookupUserId || 'null'}`);
+    if (voiceLookupMethod === 'userScopedGeneric') {
+      console.warn(`[generate-affirmation] WARNING: voice resolved via userScopedGeneric ` +
+        `for userId=${lookupUserId} — generic match may be a stale/older sample.`);
+      Sentry.captureMessage('generate_affirmation.voice_lookup_generic', {
+        level: 'warning',
+        tags: { component: 'voice_lookup', endpoint: 'generate_affirmation', lookupMethod: 'userScopedGeneric' },
+        extra: { userId: lookupUserId, sessionId, file: path.basename(voicePath) },
+      });
+    }
 
     if (sessionId && voicePath) {
       // Check for a cached ElevenLabs voice_id on the authenticated user.
       // Daily affirmations reuse the cached voice — no re-clone, 1/10th the cost
       // and latency (~3s vs ~25s).
-      const authedUser = getUserByToken(req);
       const cachedRow = authedUser ? stmts.getVoiceId.get(authedUser.id) : null;
       const cachedVoiceId = cachedRow?.elevenlabsVoiceId || null;
 
@@ -1372,6 +1437,10 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     }
 
     const cloneVerified = voiceDebug?.cloneVerified === true;
+    console.log(`[generate-affirmation] result voice-lookup method=${voiceLookupMethod} ` +
+      `file=${voicePath ? path.basename(voicePath) : 'null'} ` +
+      `sessionId=${sessionId} userId=${lookupUserId || 'null'} ` +
+      `cloneMode=${voiceDebug?.cloneMode || 'unknown'}`);
     res.json({ affirmationText, audioUrl, voiceDebug, clone_verified: cloneVerified });
   } catch (err) {
     Sentry.captureException(err, {

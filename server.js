@@ -1082,6 +1082,22 @@ const onboardingUpload = upload.fields([
   { name: "voiceSample", maxCount: 1 }, // dedicated 30s reading for voice clone
 ]);
 
+const preAccountVoiceBundleUpload = upload.fields([
+  { name: "voice_1_goal", maxCount: 1 },
+  { name: "voice_2_purpose", maxCount: 1 },
+  { name: "voice_3_resistance", maxCount: 1 },
+  { name: "voice_4_commitmentReading", maxCount: 1 },
+]);
+
+function parseJsonBodyField(value, fallback = {}) {
+  if (!value) return fallback;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function safeVoiceOwnerId(userId) {
+  return userId ? String(userId).replace(/[^a-zA-Z0-9_-]/g, '') : null;
+}
+
 // ── Transcribe audio with Whisper ────────────────────────────────────
 // language: app language code (e.g. 'en-US', 'es-AR') — used to hint Whisper
 // so it doesn't auto-detect the wrong language from accent/context
@@ -1138,6 +1154,178 @@ async function detectGender(transcriptions) {
     return null;
   }
 }
+
+app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req, res) => {
+  const requestId = req.get('x-request-id') || crypto.randomUUID();
+  const correlationId = req.get('x-correlation-id') || req.get('x-voice-attempt-id') || req.body?.bundleId || requestId;
+  const startedAt = Date.now();
+
+  try {
+    const user = getUserByToken(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized", requestId, correlationId });
+
+    const language = req.body.language || user.language || 'en-US';
+    const bundleId = req.body.bundleId || correlationId;
+    const preAccountVoiceBundle = parseJsonBodyField(req.body.preAccountVoiceBundle, null);
+    const voiceProcessingPayload = parseJsonBodyField(req.body.voiceProcessingPayload, null);
+    const productProvenance = parseJsonBodyField(req.body.productProvenance, voiceProcessingPayload?.productProvenance || null);
+    const semanticCaptureOrder = parseJsonBodyField(req.body.semanticCaptureOrder, ['goal', 'purpose', 'resistance', 'commitmentReading']);
+    const voiceAttemptIds = parseJsonBodyField(req.body.voiceAttemptIds, []);
+    const answerMeta = {
+      endpoint: 'voice-bundle',
+      schemaVersion: req.body.schemaVersion || voiceProcessingPayload?.schemaVersion || null,
+      bundleId,
+      semanticCaptureOrder,
+      voiceAttemptIds,
+      productProvenance,
+      requestId,
+      correlationId,
+    };
+
+    const captureSpecs = [
+      { stage: 'goal', part: 'voice_1_goal', contextKey: 'goal' },
+      { stage: 'purpose', part: 'voice_2_purpose', contextKey: 'vision' },
+      { stage: 'resistance', part: 'voice_3_resistance', contextKey: 'blocker' },
+      { stage: 'commitmentReading', part: 'voice_4_commitmentReading', contextKey: 'commitmentReading' },
+    ];
+
+    const missing = captureSpecs.filter((spec) => !req.files?.[spec.part]?.[0]).map((spec) => spec.part);
+    if (missing.length > 0) {
+      return res.status(400).json({
+        error: 'voice_bundle_missing_required_captures',
+        missing,
+        required: captureSpecs.map((spec) => spec.part),
+        requestId,
+        correlationId,
+      });
+    }
+
+    const context = { blocker: "", vision: "", goal: "", commitmentReading: "" };
+    const audioFiles = [];
+    const transcriptions = [];
+    const captureReceipt = [];
+
+    for (const spec of captureSpecs) {
+      const uploaded = req.files[spec.part][0];
+      const filePath = uploaded.path;
+      audioFiles.push(filePath);
+      const transcription = await transcribeAudio(filePath, language);
+      if (transcription && transcription.trim().length > 5) {
+        context[spec.contextKey] = transcription;
+        transcriptions.push(transcription);
+      }
+      captureReceipt.push({
+        stage: spec.stage,
+        partName: spec.part,
+        voiceAttemptId: Array.isArray(voiceAttemptIds)
+          ? voiceAttemptIds[captureReceipt.length] || null
+          : (voiceAttemptIds && voiceAttemptIds[spec.stage]) || null,
+        originalName: uploaded.originalname || null,
+        mimeType: uploaded.mimetype || null,
+        size: uploaded.size || null,
+        transcribed: Boolean(transcription && transcription.trim().length > 5),
+      });
+    }
+
+    const detectedGender = await detectGender(transcriptions);
+    const combinedVoicePath = audioFiles[audioFiles.length - 1] || null;
+
+    if (combinedVoicePath) {
+      Sentry.setTag('voice_validator_step', 'pre_clone_voice_bundle');
+      const v1 = await voiceValidator.validateInputSample(combinedVoicePath);
+      if (!v1.ok) {
+        audioFiles.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });
+        Sentry.captureMessage('voice_validator.pre_clone_rejected', {
+          level: 'warning',
+          tags: { component: 'voice_validator', step: 'pre_clone_voice_bundle', code: v1.code },
+          extra: { duration: v1.duration, peak: v1.peak, bundleId, requestId, correlationId },
+        });
+        return res.status(v1.http || 400).json({
+          error: v1.message,
+          code: v1.code,
+          requestId,
+          correlationId,
+          voiceValidator: { step: 'pre_clone_voice_bundle', duration: v1.duration, peak: v1.peak },
+        });
+      }
+    }
+
+    const sessionId = Date.now().toString();
+    const voiceOwnerId = safeVoiceOwnerId(user.id);
+    const persistedVoiceFiles = audioFiles.map((sourcePath, index) => {
+      const ext = path.extname(sourcePath) || ".m4a";
+      const destPath = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}_${index + 1}${ext}`);
+      fs.copyFileSync(sourcePath, destPath);
+      return destPath;
+    });
+
+    if (persistedVoiceFiles.length > 0) {
+      const legacyVoicePath = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.m4a`);
+      fs.copyFileSync(persistedVoiceFiles[persistedVoiceFiles.length - 1], legacyVoicePath);
+      if (voiceOwnerId) {
+        const userVoicePath = path.join(UPLOAD_STORAGE_DIR, `voice_user_${voiceOwnerId}_${sessionId}.m4a`);
+        fs.copyFileSync(persistedVoiceFiles[persistedVoiceFiles.length - 1], userVoicePath);
+      }
+      const voiceManifest = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
+      fs.writeFileSync(voiceManifest, JSON.stringify(persistedVoiceFiles));
+    }
+    audioFiles.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });
+
+    const voiceDebug = {
+      cloneMode: ELEVENLABS_API_KEY ? 'pending' : 'not_ready',
+      sampleCount: persistedVoiceFiles.length,
+      sampleFiles: persistedVoiceFiles.map((f) => path.basename(f)),
+      answerMeta,
+      fallbackUsed: false,
+      customVoiceId: null,
+      playbackVoiceId: null,
+      modelId: null,
+      error: null,
+    };
+
+    Sentry.addBreadcrumb({
+      category: 'voice.upload',
+      level: 'info',
+      message: 'pre_account_voice_bundle.accepted',
+      data: { requestId, correlationId, bundleId, sessionId, fileCount: persistedVoiceFiles.length },
+    });
+
+    return res.json({
+      ok: true,
+      status: 'submitted',
+      provider: 'elevenlabs',
+      providerJobId: sessionId,
+      sessionId,
+      receiptId: sessionId,
+      bundleId,
+      fileCount: persistedVoiceFiles.length,
+      semanticCaptureOrder,
+      voiceAttemptIds,
+      productProvenance,
+      preAccountVoiceBundleAccepted: Boolean(preAccountVoiceBundle),
+      voiceProcessingPayloadAccepted: Boolean(voiceProcessingPayload),
+      captureReceipt,
+      context,
+      detectedGender,
+      language,
+      voiceReady: Boolean(persistedVoiceFiles.length && ELEVENLABS_API_KEY),
+      voiceCloneStatus: 'processing',
+      activeVoiceKind: 'temporary_preview',
+      voiceCloneEta: '~2 hours',
+      voiceDebug,
+      requestId,
+      correlationId,
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (err) {
+    Sentry.captureException(err, {
+      tags: { area: 'voice_upload', endpoint: 'onboarding_voice_bundle' },
+      extra: { fileKeys: Object.keys(req.files || {}), requestId, correlationId },
+    });
+    console.error("Voice bundle onboarding error:", err);
+    return res.status(500).json({ error: "Voice bundle onboarding failed", requestId, correlationId });
+  }
+});
 
 app.post("/api/onboarding", onboardingUpload, async (req, res) => {
   try {

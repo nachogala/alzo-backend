@@ -17,6 +17,9 @@ const fs = require('fs');
 const os = require('os');
 const net = require('net');
 
+const { execFileSync } = require('child_process');
+const ffmpegStatic = require('ffmpeg-static');
+
 const {
   MockAgent,
   setGlobalDispatcher,
@@ -181,8 +184,29 @@ function url() {
   return `http://127.0.0.1:${serverHarness.port}`;
 }
 
+
+let fixtureAudioBuffer;
 function audioBuffer() {
-  return Buffer.from('/+MYxAAAAANIAAAAAExBTUUzLjk5cgQAAAAAAAAAABRAJAaUQAAQAAAAEi4i', 'base64');
+  if (fixtureAudioBuffer) return Buffer.from(fixtureAudioBuffer);
+  const fixturePath = path.join(TEST_AUDIO, 'fixture-voice-sample.m4a');
+  fs.mkdirSync(TEST_AUDIO, { recursive: true });
+  execFileSync(ffmpegStatic, [
+    '-y',
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-f',
+    'lavfi',
+    '-i',
+    'sine=frequency=440:duration=1.25',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '64k',
+    fixturePath,
+  ]);
+  fixtureAudioBuffer = fs.readFileSync(fixturePath);
+  return Buffer.from(fixtureAudioBuffer);
 }
 
 async function registerUser() {
@@ -261,6 +285,8 @@ describe('POST /api/onboarding/voice-bundle', () => {
       .attach('voice_3_resistance', audioBuffer(), { filename: 'resistance.m4a', contentType: 'audio/mp4' })
       .attach('voice_4_commitmentReading', audioBuffer(), { filename: 'commitmentReading.m4a', contentType: 'audio/mp4' });
 
+
+    if (res.status !== 200) console.log('voice-bundle failure response', res.status, res.body);
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
     expect(res.body.status).toBe('submitted');
@@ -279,7 +305,18 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(res.body.captureReceipt.map((r) => r.voiceAttemptId)).toEqual(voiceAttemptIds);
     expect(res.body.sessionId).toBeTruthy();
     expect(res.body.providerJobId).toBe(res.body.sessionId);
-    expect(res.body.voiceDebug.sampleCount).toBe(4);
+
+    expect(res.body.providerFileCount).toBe(1);
+    expect(res.body.mergedVoiceArtifact).toMatchObject({
+      sourceCaptures: 4,
+      voiceAttemptIds,
+      providerFileCount: 1,
+      providerJobId: res.body.sessionId,
+    });
+    expect(res.body.mergedVoiceArtifact.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(res.body.voiceDebug.sampleCount).toBe(1);
+    expect(res.body.voiceDebug.sourceSampleCount).toBe(4);
+    expect(res.body.voiceDebug.mergedVoiceArtifact.sha256).toBe(res.body.mergedVoiceArtifact.sha256);
     expect(res.body.voiceDebug.answerMeta.bundleId).toBe(bundleId);
     expect(res.body.voiceDebug.answerMeta.voiceAttemptIds).toEqual(voiceAttemptIds);
     expect(res.body.context.goal).toMatch(/choose the work/i);
@@ -290,8 +327,12 @@ describe('POST /api/onboarding/voice-bundle', () => {
     const manifestPath = path.join(TEST_UPLOADS, `voice_manifest_${res.body.sessionId}.json`);
     expect(fs.existsSync(manifestPath)).toBe(true);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-    expect(manifest).toHaveLength(4);
-    for (const persisted of manifest) {
+
+    expect(manifest.schemaVersion).toBe('alzo.voice_manifest.v2');
+    expect(manifest.sourceCaptureFiles).toHaveLength(4);
+    expect(manifest.providerFiles).toHaveLength(1);
+    expect(manifest.mergedVoiceArtifact.sha256).toBe(res.body.mergedVoiceArtifact.sha256);
+    for (const persisted of [...manifest.sourceCaptureFiles, ...manifest.providerFiles]) {
       expect(fs.existsSync(persisted)).toBe(true);
     }
 
@@ -311,7 +352,10 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(elevenState.cloneCalls).toBeGreaterThanOrEqual(1);
     expect(elevenState.ttsCalls).toBeGreaterThanOrEqual(1);
     expect(firstMessage.body.audioUrl).toBeTruthy();
-    expect(firstMessage.body.voiceDebug?.sampleCount).toBe(4);
+
+    expect(firstMessage.body.voiceDebug?.sampleCount).toBe(1);
+    expect(firstMessage.body.voiceDebug?.sampleFiles).toHaveLength(1);
+    expect(firstMessage.body.voiceDebug?.sampleFiles?.[0]).toMatch(/merged\.m4a$/);
     expect(firstMessage.body.voiceDebug?.cloneMode).toBe('cloned');
   }, 30000);
 });

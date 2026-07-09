@@ -173,8 +173,8 @@ afterAll(() => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-describe('FIX (a) — /api/generate-affirmation null-audio fallback guard', () => {
-  it('clone add fails (500) → endpoint still returns a non-null audioUrl (preset fallback engaged)', async () => {
+describe('FIX (a) — /api/generate-affirmation self-voice failure guard', () => {
+  it('clone add fails (500) → endpoint blocks first-message success instead of returning preset fallback audio', async () => {
     mockAgent = mockAgentSetup();
     const el = mockAgent.get('https://api.elevenlabs.io');
     // Clone add hard-fails — pre-fix this left audioUrl=null all the way out.
@@ -201,18 +201,14 @@ describe('FIX (a) — /api/generate-affirmation null-audio fallback guard', () =
       .set('Authorization', `Bearer ${token}`)
       .send({ context: 'launch ALZO', sessionId, language: 'en-US', detectedGender: 'male' });
 
-    // The endpoint itself must NOT 5xx and MUST carry usable audio.
-    expect(aff.status).toBe(200);
-    // FIX (a) PROOF: the clone add was mocked to 500 → cloneVoiceAndSpeak
-    // returns audioUrl=null with a clone-failure cloneMode. The NEW if(!audioUrl)
-    // guard then runs textToSpeechFallback, which overwrites voiceDebug — so a
-    // cloneMode of 'fallback' is the signature that the guard engaged.
-    // (Pre-fix: voiceDebug.cloneMode stayed 'clone_failed' AND audioUrl was null.)
-    expect(aff.body.voiceDebug?.cloneMode).toBe('fallback');
-    // ...and the user therefore always gets playable audio, never null.
-    expect(aff.body.audioUrl).toBeTruthy();
-    expect(typeof aff.body.audioUrl).toBe('string');
-    expect(aff.body.audioUrl.length).toBeGreaterThan(0);
+    // Build 23 contract: first-message success requires a verified self voice.
+    // A preset fallback may exist for explicit recovery surfaces, but it must not
+    // return a 200/audioUrl that lets onboarding advance as if the clone worked.
+    expect(aff.status).toBe(502);
+    expect(aff.body.error).toContain('internal error');
+    expect(aff.body.voiceDebug?.cloneMode).toBe('clone_failed');
+    expect(aff.body.voiceDebug?.fallbackBlocked).toBe(true);
+    expect(aff.body.audioUrl).toBeFalsy();
   }, 30000);
 });
 

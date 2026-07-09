@@ -15,6 +15,8 @@ const OpenAI = require("openai");
 const Stripe = require("stripe");
 
 const crypto = require("crypto");
+const { execFile } = require("child_process");
+const ffmpegStatic = require("ffmpeg-static");
 const Database = require("better-sqlite3");
 const { OAuth2Client } = require("google-auth-library");
 const appleSignin = require("apple-signin-auth");
@@ -631,6 +633,61 @@ function withTimeout(promise, ms) {
   ]);
 }
 
+function classifyElevenLabsFailure(status, bodyOrError) {
+  const body = String(bodyOrError || '').toLowerCase();
+  if (status === 401 || status === 403 || body.includes('unauthorized') || body.includes('forbidden') || body.includes('invalid api key')) return 'auth_error';
+  if (status === 429 || body.includes('rate_limit') || body.includes('too many requests')) return 'rate_limit';
+  if (!status || body.includes('timeout') || body.includes('deadline') || body.includes('aborted')) return 'provider_timeout';
+  if (status >= 500 || body.includes('service unavailable') || body.includes('bad gateway')) return 'provider_down';
+  if (body.includes('invalid_audio') || body.includes('audio') || body.includes('silence') || body.includes('too short')) return 'bad_audio';
+  return 'provider_rejected';
+}
+
+function providerRetryAction(failureKind) {
+  if (failureKind === 'auth_error') return 'fix_provider_credentials';
+  if (failureKind === 'rate_limit') return 'retry_after_provider_backoff';
+  if (failureKind === 'provider_timeout') return 'retry_provider_request';
+  if (failureKind === 'provider_down') return 'retry_when_provider_available';
+  if (failureKind === 'bad_audio') return 'recapture_voice_audio';
+  if (failureKind === 'provider_job_timeout') return 'poll_or_retry_provider_job';
+  if (failureKind === 'audio_return_missing') return 'retry_audio_return_fetch';
+  return 'retry_provider_request';
+}
+
+async function readProviderBody(providerRes) {
+  if (!providerRes) return null;
+  try {
+    const text = await providerRes.text();
+    if (!text) return null;
+    try { return JSON.parse(text); } catch { return text; }
+  } catch (err) {
+    return `body_read_failed:${err.message}`;
+  }
+}
+
+async function checkElevenLabsEndpoint(pathname, { timeoutMs = 10000 } = {}) {
+  const startedAt = Date.now();
+  try {
+    const providerRes = await withTimeout(fetch(`${ELEVENLABS_BASE}${pathname}`, {
+      method: 'GET',
+      headers: { 'xi-api-key': ELEVENLABS_API_KEY },
+    }), timeoutMs);
+    const durationMs = Date.now() - startedAt;
+    if (!providerRes) {
+      return { ok: false, status: null, error: 'provider_timeout', failureKind: 'provider_timeout', durationMs };
+    }
+    const body = await readProviderBody(providerRes);
+    if (!providerRes.ok) {
+      const failureKind = classifyElevenLabsFailure(providerRes.status, typeof body === 'string' ? body : JSON.stringify(body || {}));
+      return { ok: false, status: providerRes.status, error: failureKind, failureKind, body, durationMs };
+    }
+    return { ok: true, status: providerRes.status, body, durationMs };
+  } catch (err) {
+    const failureKind = classifyElevenLabsFailure(null, err.message || err.name || 'provider_error');
+    return { ok: false, status: null, error: failureKind, failureKind, body: err.message, durationMs: Date.now() - startedAt };
+  }
+}
+
 // INC-V-010: deterministic voice-slot eviction. When the ElevenLabs account
 // is at its custom-voice ceiling, free exactly one slot by deleting the oldest
 // cloned voice that is NOT owned by any ALZO user (orphan QA / abandoned clone).
@@ -1098,6 +1155,118 @@ function safeVoiceOwnerId(userId) {
   return userId ? String(userId).replace(/[^a-zA-Z0-9_-]/g, '') : null;
 }
 
+
+function escapeFfmpegConcatPath(filePath) {
+  return String(filePath).replace(/'/g, "'\\''");
+}
+
+function runExecFile(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, options, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceipt, voiceAttemptIds }) {
+  const files = (sourceFiles || []).filter(Boolean);
+  if (files.length !== 4) {
+    return { ok: false, error: 'merged_voice_source_count_required', expected: 4, actual: files.length };
+  }
+  for (const filePath of files) {
+    if (!fs.existsSync(filePath)) {
+      return { ok: false, error: 'merged_voice_source_missing', file: path.basename(filePath) };
+    }
+  }
+  if (!ffmpegStatic) {
+    return { ok: false, error: 'ffmpeg_required_for_merged_voice_artifact' };
+  }
+
+  const listPath = path.join(UPLOAD_STORAGE_DIR, `voice_merge_${sessionId}.txt`);
+  const mergedPath = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}_merged.m4a`);
+  const sourceCaptureIds = (captureReceipt || []).map((item) => item.stage).filter(Boolean);
+  fs.writeFileSync(listPath, files.map((filePath) => `file '${escapeFfmpegConcatPath(filePath)}'`).join('\n'));
+  try {
+    await runExecFile(ffmpegStatic, [
+      '-y',
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', listPath,
+      '-vn',
+      '-acodec', 'aac',
+      '-b:a', '128k',
+      mergedPath,
+    ], { timeout: 45000 });
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'merged_voice_artifact_failed',
+      detail: String(err.stderr || err.message || err).slice(0, 500),
+    };
+  } finally {
+    try { fs.unlinkSync(listPath); } catch {}
+  }
+
+  if (!fs.existsSync(mergedPath) || fs.statSync(mergedPath).size <= 0) {
+    return { ok: false, error: 'merged_voice_artifact_missing_or_empty' };
+  }
+
+  const sha256 = crypto.createHash('sha256').update(fs.readFileSync(mergedPath)).digest('hex');
+  const validator = await voiceValidator.validateInputSample(mergedPath);
+  if (!validator.ok) {
+    try { fs.unlinkSync(mergedPath); } catch {}
+    return {
+      ok: false,
+      error: validator.message || 'merged_voice_artifact_invalid',
+      code: validator.code,
+      http: validator.http,
+      duration: validator.duration,
+      peak: validator.peak,
+    };
+  }
+
+  return {
+    ok: true,
+    path: mergedPath,
+    artifact: {
+      path: mergedPath,
+      filename: path.basename(mergedPath),
+      sourceCaptures: files.length,
+      captureIds: sourceCaptureIds,
+      voiceAttemptIds: Array.isArray(voiceAttemptIds) ? voiceAttemptIds : [],
+      totalDurationSeconds: validator.duration || null,
+      peak: validator.peak || null,
+      sha256,
+      providerJobId: sessionId,
+      providerFileCount: 1,
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+function parseVoiceManifest(raw) {
+  if (Array.isArray(raw)) {
+    return { providerFiles: raw, sourceCaptureFiles: raw, mergedVoiceArtifact: null, legacyArray: true };
+  }
+  if (raw && typeof raw === 'object') {
+    return {
+      providerFiles: Array.isArray(raw.providerFiles) ? raw.providerFiles : [],
+      sourceCaptureFiles: Array.isArray(raw.sourceCaptureFiles) ? raw.sourceCaptureFiles : [],
+      mergedVoiceArtifact: raw.mergedVoiceArtifact || null,
+      legacyArray: false,
+    };
+  }
+  return { providerFiles: [], sourceCaptureFiles: [], mergedVoiceArtifact: null, legacyArray: false };
+}
+
 // ── Transcribe audio with Whisper ────────────────────────────────────
 // language: app language code (e.g. 'en-US', 'es-AR') — used to hint Whisper
 // so it doesn't auto-detect the wrong language from accent/context
@@ -1228,27 +1397,6 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
     }
 
     const detectedGender = await detectGender(transcriptions);
-    const combinedVoicePath = audioFiles[audioFiles.length - 1] || null;
-
-    if (combinedVoicePath) {
-      Sentry.setTag('voice_validator_step', 'pre_clone_voice_bundle');
-      const v1 = await voiceValidator.validateInputSample(combinedVoicePath);
-      if (!v1.ok) {
-        audioFiles.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });
-        Sentry.captureMessage('voice_validator.pre_clone_rejected', {
-          level: 'warning',
-          tags: { component: 'voice_validator', step: 'pre_clone_voice_bundle', code: v1.code },
-          extra: { duration: v1.duration, peak: v1.peak, bundleId, requestId, correlationId },
-        });
-        return res.status(v1.http || 400).json({
-          error: v1.message,
-          code: v1.code,
-          requestId,
-          correlationId,
-          voiceValidator: { step: 'pre_clone_voice_bundle', duration: v1.duration, peak: v1.peak },
-        });
-      }
-    }
 
     const sessionId = Date.now().toString();
     const voiceOwnerId = safeVoiceOwnerId(user.id);
@@ -1259,22 +1407,56 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       return destPath;
     });
 
-    if (persistedVoiceFiles.length > 0) {
+
+    const mergeResult = await createMergedVoiceArtifact({
+      sessionId,
+      sourceFiles: persistedVoiceFiles,
+      captureReceipt,
+      voiceAttemptIds,
+    });
+    if (!mergeResult.ok) {
+      audioFiles.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });
+      persistedVoiceFiles.forEach((f) => { try { fs.unlinkSync(f); } catch {} });
+      Sentry.captureMessage('voice_validator.merged_voice_rejected', {
+        level: 'warning',
+        tags: { component: 'voice_validator', step: 'merged_voice_artifact', code: mergeResult.code || mergeResult.error },
+        extra: { bundleId, requestId, correlationId, error: mergeResult.error, detail: mergeResult.detail || null, duration: mergeResult.duration || null, peak: mergeResult.peak || null },
+      });
+      return res.status(mergeResult.http || 400).json({
+        error: mergeResult.error,
+        code: mergeResult.code || mergeResult.error,
+        requestId,
+        correlationId,
+        voiceValidator: { step: 'merged_voice_artifact', duration: mergeResult.duration || null, peak: mergeResult.peak || null },
+      });
+    }
+
+    const providerVoiceFiles = [mergeResult.path];
+    if (mergeResult.path) {
       const legacyVoicePath = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.m4a`);
-      fs.copyFileSync(persistedVoiceFiles[persistedVoiceFiles.length - 1], legacyVoicePath);
+      fs.copyFileSync(mergeResult.path, legacyVoicePath);
       if (voiceOwnerId) {
         const userVoicePath = path.join(UPLOAD_STORAGE_DIR, `voice_user_${voiceOwnerId}_${sessionId}.m4a`);
-        fs.copyFileSync(persistedVoiceFiles[persistedVoiceFiles.length - 1], userVoicePath);
+        fs.copyFileSync(mergeResult.path, userVoicePath);
       }
       const voiceManifest = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
-      fs.writeFileSync(voiceManifest, JSON.stringify(persistedVoiceFiles));
+      fs.writeFileSync(voiceManifest, JSON.stringify({
+        schemaVersion: 'alzo.voice_manifest.v2',
+        providerFiles: providerVoiceFiles,
+        sourceCaptureFiles: persistedVoiceFiles,
+        mergedVoiceArtifact: mergeResult.artifact,
+      }));
     }
     audioFiles.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });
 
     const voiceDebug = {
       cloneMode: ELEVENLABS_API_KEY ? 'pending' : 'not_ready',
-      sampleCount: persistedVoiceFiles.length,
-      sampleFiles: persistedVoiceFiles.map((f) => path.basename(f)),
+
+      sampleCount: providerVoiceFiles.length,
+      sourceSampleCount: persistedVoiceFiles.length,
+      sampleFiles: providerVoiceFiles.map((f) => path.basename(f)),
+      sourceSampleFiles: persistedVoiceFiles.map((f) => path.basename(f)),
+      mergedVoiceArtifact: mergeResult.artifact,
       answerMeta,
       fallbackUsed: false,
       customVoiceId: null,
@@ -1287,7 +1469,8 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       category: 'voice.upload',
       level: 'info',
       message: 'pre_account_voice_bundle.accepted',
-      data: { requestId, correlationId, bundleId, sessionId, fileCount: persistedVoiceFiles.length },
+
+      data: { requestId, correlationId, bundleId, sessionId, sourceFileCount: persistedVoiceFiles.length, providerFileCount: providerVoiceFiles.length, mergedVoiceArtifact: mergeResult.artifact?.filename || null },
     });
 
     return res.json({
@@ -1299,6 +1482,9 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       receiptId: sessionId,
       bundleId,
       fileCount: persistedVoiceFiles.length,
+
+      providerFileCount: providerVoiceFiles.length,
+      mergedVoiceArtifact: mergeResult.artifact,
       semanticCaptureOrder,
       voiceAttemptIds,
       productProvenance,
@@ -1576,12 +1762,19 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       const cachedRow = authedUser ? stmts.getVoiceId.get(authedUser.id) : null;
       const cachedVoiceId = cachedRow?.elevenlabsVoiceId || null;
 
-      // Try to use manifest (all samples) for better clone if no cache yet
+      // Try manifest provider files first. Build 23 writes a v2 manifest where
+      // providerFiles contains exactly one merged voice-training artifact while
+      // sourceCaptureFiles preserves the four emotional captures. Legacy array
+      // manifests remain supported for older sessions only.
       let voiceArg = voicePath;
       if (fs.existsSync(manifestPath)) {
         try {
-          const files = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).filter(f => fs.existsSync(f));
-          if (files.length > 1) voiceArg = files;
+          const parsedManifest = parseVoiceManifest(JSON.parse(fs.readFileSync(manifestPath, 'utf8')));
+          const files = (parsedManifest.providerFiles.length ? parsedManifest.providerFiles : parsedManifest.sourceCaptureFiles).filter(f => fs.existsSync(f));
+          if (files.length > 0) voiceArg = files.length === 1 ? files[0] : files;
+          if (parsedManifest.mergedVoiceArtifact) {
+            voiceLookupMethod = 'mergedVoiceArtifact';
+          }
         } catch {}
         // Keep manifest so subsequent daily affirmations can reuse samples
       }
@@ -1608,20 +1801,26 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
         });
       }
     } else {
-      const fallbackResult = await textToSpeechFallback(affirmationText, gender, language);
-      audioUrl = fallbackResult.audioUrl;
-      voiceDebug = fallbackResult.voiceDebug;
+      return res.status(409).json({
+        error: 'voice_sample_required_for_self_voice_first_message',
+        code: 'VOICE_SAMPLE_REQUIRED',
+        voiceDebug: { cloneMode: 'not_ready', fallbackUsed: false, error: 'voice_sample_required_for_self_voice_first_message' },
+        clone_verified: false,
+      });
     }
 
-    // INC-V fix: clone path can resolve audioUrl=null (clone_failed,
-    // tts_failed_*, clone_error, stale-with-no-sample) WITHOUT throwing and
-    // WITHOUT being a hard VOICE_CLONE_GLITCHED 502. Without this guard the
-    // app receives audioUrl:null and the value moment dies silently. Mirrors
-    // the guard on /api/affirmation/today (~line 1298).
+    // Build 23 contract: /api/generate-affirmation is the onboarding first
+    // message path. A fallback/preset voice may be useful in a recovery screen,
+    // but it must never complete onboarding or emit first_message.ready. If a
+    // voice clone/TTS failed after samples existed, surface a structured retry.
     if (!audioUrl) {
-      const fb = await textToSpeechFallback(affirmationText, gender, language);
-      audioUrl = fb.audioUrl;
-      voiceDebug = fb.voiceDebug;
+      return res.status(502).json({
+        error: voiceDebug?.error || 'self_voice_generation_failed',
+        code: voiceDebug?.errorCode || 'SELF_VOICE_GENERATION_FAILED',
+        retryAction: 'retry_voice_generation',
+        voiceDebug,
+        clone_verified: false,
+      });
     }
 
     const cloneVerified = voiceDebug?.cloneVerified === true;
@@ -2399,45 +2598,128 @@ app.get("/api/health", (req, res) => {
 });
 
 app.get("/api/health/voice", async (req, res) => {
+  const requestId = req.get('x-request-id') || crypto.randomUUID();
+  const correlationId = req.get('x-correlation-id') || req.get('x-voice-attempt-id') || requestId;
+  const startedAt = Date.now();
   const user = getUserByToken(req);
-  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  if (!user) return res.status(401).json({ error: "Unauthorized", requestId, correlationId });
 
-  const cachedVoiceId = stmts.getVoiceId.get(user.id)?.elevenlabsVoiceId || null;
-  if (!cachedVoiceId) {
-    return res.json({ status: "missing", hasVoiceId: false, providerReachable: !!ELEVENLABS_API_KEY });
-  }
+  const basePayload = {
+    ok: false,
+    provider: 'elevenlabs',
+    stage: 'provider_health',
+    requestId,
+    correlationId,
+    apiKeyPresent: !!ELEVENLABS_API_KEY,
+    connectivity: false,
+    liveEndpointAvailable: false,
+    cloneEndpoint: 'not_checked',
+    generationEndpoint: 'not_checked',
+    cachedVoiceChecked: false,
+    cachedVoiceStatus: 'not_checked',
+    coverage: 'live_provider_account_probe_no_mutation',
+  };
+
+  const finish = (httpStatus, payload) => {
+    const finalPayload = { ...basePayload, ...payload, durationMs: Date.now() - startedAt };
+    Sentry.addBreadcrumb({
+      category: 'voice.provider.health',
+      level: finalPayload.ok ? 'info' : 'warning',
+      message: finalPayload.ok ? 'ready' : 'failed',
+      data: {
+        requestId,
+        correlationId,
+        failureKind: finalPayload.failureKind || null,
+        status: finalPayload.providerStatus || null,
+      },
+    });
+    if (!finalPayload.ok) {
+      Sentry.captureMessage('voice.provider.health.failed', {
+        level: finalPayload.failureKind === 'auth_error' ? 'error' : 'warning',
+        tags: {
+          component: 'elevenlabs',
+          endpoint: 'health_voice',
+          provider: 'elevenlabs',
+          failure_kind: finalPayload.failureKind || 'unknown',
+        },
+        extra: {
+          requestId,
+          correlationId,
+          providerStatus: finalPayload.providerStatus || null,
+          providerBody: finalPayload.providerBody || null,
+          cachedVoiceStatus: finalPayload.cachedVoiceStatus || null,
+        },
+      });
+    }
+    return res.status(httpStatus).json(finalPayload);
+  };
 
   if (!ELEVENLABS_API_KEY) {
-    return res.json({ status: "unknown", hasVoiceId: true, providerReachable: false });
+    return finish(503, {
+      error: 'elevenlabs_api_key_missing',
+      failureKind: 'auth_error',
+      retryAction: providerRetryAction('auth_error'),
+    });
   }
 
-  try {
-    const providerRes = await withTimeout(fetch(`${ELEVENLABS_BASE}/voices/${cachedVoiceId}`, {
-      headers: { "xi-api-key": ELEVENLABS_API_KEY },
-    }), 10000);
-
-    if (!providerRes) {
-      return res.status(504).json({ status: "timeout", hasVoiceId: true, providerReachable: false });
-    }
-
-    if (providerRes.status === 404) {
-      return res.json({ status: "stale", hasVoiceId: true, providerReachable: true });
-    }
-
-    if (!providerRes.ok) {
-      Sentry.captureMessage('ElevenLabs voice health check failed', {
-        level: 'warning',
-        tags: { area: 'voice_health', endpoint: 'health_voice' },
-        extra: { providerStatus: providerRes.status },
-      });
-      return res.status(502).json({ status: "provider_error", hasVoiceId: true, providerReachable: true, providerStatus: providerRes.status });
-    }
-
-    return res.json({ status: "ok", hasVoiceId: true, providerReachable: true });
-  } catch (err) {
-    Sentry.captureException(err, { tags: { area: 'voice_health', endpoint: 'health_voice' } });
-    return res.status(500).json({ status: "error", hasVoiceId: true, providerReachable: false });
+  const accountCheck = await checkElevenLabsEndpoint('/voices', { timeoutMs: 10000 });
+  if (!accountCheck.ok) {
+    const failureKind = accountCheck.failureKind || classifyElevenLabsFailure(accountCheck.status, accountCheck.error || accountCheck.body);
+    const httpStatus = failureKind === 'auth_error' ? 401 : failureKind === 'rate_limit' ? 429 : failureKind === 'provider_timeout' ? 504 : 502;
+    return finish(httpStatus, {
+      error: accountCheck.error || failureKind,
+      failureKind,
+      retryAction: providerRetryAction(failureKind),
+      providerStatus: accountCheck.status,
+      providerBody: typeof accountCheck.body === 'string' ? accountCheck.body.slice(0, 500) : accountCheck.body,
+      connectivity: Boolean(accountCheck.status),
+      liveEndpointAvailable: false,
+      cloneEndpoint: 'voices_list_failed',
+      generationEndpoint: 'not_checked',
+    });
   }
+
+  const cachedVoiceId = stmts.getVoiceId.get(user.id)?.elevenlabsVoiceId || null;
+  let cachedVoiceStatus = cachedVoiceId ? 'not_checked' : 'missing';
+  let cachedVoiceCheck = null;
+  if (cachedVoiceId) {
+    cachedVoiceCheck = await checkElevenLabsEndpoint(`/voices/${encodeURIComponent(cachedVoiceId)}`, { timeoutMs: 10000 });
+    cachedVoiceStatus = cachedVoiceCheck.ok ? 'ok' : (cachedVoiceCheck.status === 404 ? 'stale' : 'provider_error');
+  }
+
+  if (cachedVoiceCheck && !cachedVoiceCheck.ok && cachedVoiceCheck.status !== 404) {
+    const failureKind = cachedVoiceCheck.failureKind || classifyElevenLabsFailure(cachedVoiceCheck.status, cachedVoiceCheck.error || cachedVoiceCheck.body);
+    const httpStatus = failureKind === 'auth_error' ? 401 : failureKind === 'rate_limit' ? 429 : failureKind === 'provider_timeout' ? 504 : 502;
+    return finish(httpStatus, {
+      error: cachedVoiceCheck.error || failureKind,
+      failureKind,
+      retryAction: providerRetryAction(failureKind),
+      providerStatus: cachedVoiceCheck.status,
+      providerBody: typeof cachedVoiceCheck.body === 'string' ? cachedVoiceCheck.body.slice(0, 500) : cachedVoiceCheck.body,
+      connectivity: true,
+      liveEndpointAvailable: true,
+      cloneEndpoint: 'voices_list_checked',
+      generationEndpoint: 'cached_voice_lookup_failed',
+      cachedVoiceChecked: true,
+      cachedVoiceStatus,
+      cachedVoiceId,
+    });
+  }
+
+  return finish(200, {
+    ok: true,
+    status: cachedVoiceStatus === 'stale' ? 'stale_cached_voice' : 'ok',
+    connectivity: true,
+    liveEndpointAvailable: true,
+    cloneEndpoint: 'voices_list_checked',
+    generationEndpoint: cachedVoiceId ? 'cached_voice_lookup_checked' : 'not_mutated_no_cached_voice',
+    cachedVoiceChecked: Boolean(cachedVoiceId),
+    cachedVoiceStatus,
+    cachedVoiceId: cachedVoiceId || null,
+    providerStatus: accountCheck.status,
+    failureKind: cachedVoiceStatus === 'stale' ? 'provider_job_timeout' : null,
+    retryAction: cachedVoiceStatus === 'stale' ? providerRetryAction('provider_job_timeout') : null,
+  });
 });
 
 // ── ALIGNMENT SYSTEM ENDPOINTS ──────────────────────────────────────

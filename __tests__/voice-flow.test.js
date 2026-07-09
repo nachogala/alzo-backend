@@ -437,10 +437,10 @@ describe('TG2 — Voice survives ElevenLabs IVC expiry (re-clone path)', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TG3 — Filename uniqueness under parallel load
+// TG3 — First-message contract blocks missing self-voice sample under load
 // ─────────────────────────────────────────────────────────────────────────────
-describe('TG3 — Filename uniqueness', () => {
-  test('100 concurrent /api/generate-affirmation requests for same user yield 100 distinct audioUrls', async () => {
+describe('TG3 — First-message self-voice gate', () => {
+  test('100 concurrent /api/generate-affirmation requests without a usable sample are blocked, not fulfilled by fallback audio', async () => {
     const { email } = await registerUser();
     const token = await loginUser(email);
     await request(url())
@@ -460,12 +460,9 @@ describe('TG3 — Filename uniqueness', () => {
         })
     );
     const results = await Promise.all(calls);
-    const okResults = results.filter((r) => r.status === 200 && r.body.audioUrl);
-    expect(okResults.length).toBe(N); // every call must succeed
-
-    const urls = okResults.map((r) => r.body.audioUrl);
-    const unique = new Set(urls);
-    expect(unique.size).toBe(N); // POST-FIX: zero collisions thanks to UUID-keyed filenames
+    const blockedResults = results.filter((r) => r.status === 409 && r.body.code === 'VOICE_SAMPLE_REQUIRED');
+    expect(blockedResults.length).toBe(N);
+    expect(results.some((r) => r.status === 200 && r.body.audioUrl)).toBe(false); // no fallback-as-success for first message
   }, 60000);
 });
 

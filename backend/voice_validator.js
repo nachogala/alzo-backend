@@ -33,7 +33,7 @@ try { ffmpegPath = require("ffmpeg-static"); } catch {}
 try { ffprobePath = require("ffprobe-static")?.path || null; } catch {}
 
 function decoderAvailable() {
-  return !!(ffmpegPath && ffprobePath && fs.existsSync(ffmpegPath) && fs.existsSync(ffprobePath));
+  return !!(ffmpegPath && fs.existsSync(ffmpegPath));
 }
 
 function run(cmd, args, { timeoutMs = 10000 } = {}) {
@@ -74,16 +74,33 @@ function run(cmd, args, { timeoutMs = 10000 } = {}) {
 }
 
 async function probeDurationSec(filePath) {
-  if (!ffprobePath) return null;
-  const r = await run(ffprobePath, [
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
-    filePath,
-  ]);
-  if (r.code !== 0) return null;
-  const v = parseFloat(String(r.stdout).trim());
-  return Number.isFinite(v) ? v : null;
+  if (ffprobePath) {
+    const r = await run(ffprobePath, [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ]);
+    if (r.code === 0) {
+      const v = parseFloat(String(r.stdout).trim());
+      if (Number.isFinite(v)) return v;
+    }
+  }
+  // Some ffprobe-static releases have shipped an x86_64 binary inside the
+  // darwin/arm64 path. Measure with ffmpeg's decoded input header instead of
+  // trusting client metadata or weakening the 40-second valid-audio gate.
+  if (!ffmpegPath) return null;
+  const fallback = await run(ffmpegPath, [
+    "-hide_banner", "-i", filePath,
+    "-vn", "-sn", "-dn", "-f", "null", "-",
+  ], { timeoutMs: 15000 });
+  const match = String(fallback.stderr).match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+  const total = hours * 3600 + minutes * 60 + seconds;
+  return Number.isFinite(total) ? total : null;
 }
 
 async function probePeakAmplitude(filePath) {

@@ -17,7 +17,7 @@ const _state = {
   transcriptionCalls: 0,
   failNext: false,
   responses: {
-    chat: 'You are showing up. Keep going.',
+    chat: 'I am finishing the prototype because it supports my family. When it gets difficult, I remember why I began.',
     transcription: 'I want to be more present and grow my business.',
   },
 };
@@ -77,7 +77,7 @@ OpenAIStub._reset = () => {
   _state.chatCalls = 0;
   _state.transcriptionCalls = 0;
   _state.failNext = false;
-  _state.responses.chat = 'You are showing up. Keep going.';
+  _state.responses.chat = 'I am finishing the prototype because it supports my family. When it gets difficult, I remember why I began.';
   _state.responses.transcription = 'I want to be more present and grow my business.';
 };
 

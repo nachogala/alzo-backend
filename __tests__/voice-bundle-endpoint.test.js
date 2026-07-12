@@ -2,8 +2,8 @@
  * Contract coverage for Build 21 backend gap:
  *   POST /api/onboarding/voice-bundle
  *
- * The mobile contract sends four semantic captures:
- *   goal, purpose, resistance, commitmentReading
+ * The mobile contract sends four captures in the R2 Final order:
+ *   goal, purpose, reconnectionAnchor, commitment
  * with voiceAttemptId/session correlation and product provenance. This test
  * proves the backend route accepts that contract, persists all 4 samples under
  * one session manifest, and returns a receipt compatible with the first-message
@@ -76,7 +76,7 @@ function installOpenAIMock(agent) {
   pool
     .intercept({ path: '/v1/chat/completions', method: 'POST' })
     .reply(200, {
-      choices: [{ message: { content: 'unknown' } }],
+      choices: [{ message: { content: 'I choose the work because my purpose matters to me. I return by remembering what I already named.' } }],
     })
     .persist();
 }
@@ -140,9 +140,9 @@ async function bootServer() {
   sentryStub._reset();
   jest.resetModules();
   jest.doMock('../backend/voice_validator', () => ({
-    validateInputSample: jest.fn(async () => ({ ok: true, soft: false, duration: 4.2, peak: 0.3 })),
+    validateInputSample: jest.fn(async () => ({ ok: true, soft: false, duration: 40.2, peak: 0.3 })),
     validateTtsRender: jest.fn(async () => ({ ok: true, soft: false, duration: 5.1, peak: 0.25 })),
-    analyzeFile: jest.fn(async () => ({ ok: true, reason: null, duration: 4.2, peak: 0.3 })),
+    analyzeFile: jest.fn(async () => ({ ok: true, reason: null, duration: 40.2, peak: 0.3 })),
     decoderAvailable: jest.fn(() => true),
     THRESHOLDS: { MIN_INPUT_DURATION_S: 3, MIN_TTS_DURATION_S: 4, MIN_PEAK_AMPLITUDE: 0.05 },
   }));
@@ -215,7 +215,7 @@ async function registerUser() {
     .post('/api/auth/signup')
     .send({ email, password: 'test-pass-1234', name: 'Voice Bundle QA' })
     .set('Content-Type', 'application/json');
-  return { email, token: res.body?.token, status: res.status };
+  return { email, token: res.body?.token, userId: res.body?.userId, status: res.status };
 }
 
 beforeEach(async () => {
@@ -238,7 +238,7 @@ afterAll(() => {
 
 describe('POST /api/onboarding/voice-bundle', () => {
   it('accepts the Build 21 four-capture contract and preserves provenance/session correlation', async () => {
-    const { token, status } = await registerUser();
+    const { token, userId, status } = await registerUser();
     expect(status).toBe(200);
     expect(token).toBeTruthy();
 
@@ -246,14 +246,15 @@ describe('POST /api/onboarding/voice-bundle', () => {
     const voiceAttemptIds = [
       'attempt_goal_1',
       'attempt_purpose_2',
-      'attempt_resistance_3',
+      'attempt_anchor_3',
       'attempt_commitment_4',
     ];
-    const semanticCaptureOrder = ['goal', 'purpose', 'resistance', 'commitmentReading'];
+    const semanticCaptureOrder = ['goal', 'purpose', 'reconnectionAnchor', 'commitment'];
     const productProvenance = {
-      build: 21,
+      build: 24,
       source: 'alzo3-pre-account-voice-bundle',
       requiredCaptureKeys: semanticCaptureOrder,
+      captures: semanticCaptureOrder.map((stage, index) => ({ captureId: `capture_${index + 1}_${stage}`, stage, signalClass: 'human_voice_detected' })),
     };
     const voiceProcessingPayload = {
       schemaVersion: 'pre_account_voice_bundle.v1',
@@ -272,7 +273,7 @@ describe('POST /api/onboarding/voice-bundle', () => {
       .set('Authorization', `Bearer ${token}`)
       .set('x-request-id', 'req_voice_bundle_test')
       .set('x-correlation-id', bundleId)
-      .field('schemaVersion', 'pre_account_voice_bundle.v1')
+      .field('schemaVersion', 'alzo.pre_account_voice_bundle.r2.v1')
       .field('language', 'en-US')
       .field('bundleId', bundleId)
       .field('preAccountVoiceBundle', JSON.stringify({ bundleId, captures: {} }))
@@ -282,8 +283,8 @@ describe('POST /api/onboarding/voice-bundle', () => {
       .field('voiceAttemptIds', JSON.stringify(voiceAttemptIds))
       .attach('voice_1_goal', audioBuffer(), { filename: 'goal.m4a', contentType: 'audio/mp4' })
       .attach('voice_2_purpose', audioBuffer(), { filename: 'purpose.m4a', contentType: 'audio/mp4' })
-      .attach('voice_3_resistance', audioBuffer(), { filename: 'resistance.m4a', contentType: 'audio/mp4' })
-      .attach('voice_4_commitmentReading', audioBuffer(), { filename: 'commitmentReading.m4a', contentType: 'audio/mp4' });
+      .attach('voice_3_reconnectionAnchor', audioBuffer(), { filename: 'reconnectionAnchor.m4a', contentType: 'audio/mp4' })
+      .attach('voice_4_commitment', audioBuffer(), { filename: 'commitment.m4a', contentType: 'audio/mp4' });
 
 
     if (res.status !== 200) console.log('voice-bundle failure response', res.status, res.body);
@@ -299,8 +300,8 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(res.body.captureReceipt.map((r) => r.partName)).toEqual([
       'voice_1_goal',
       'voice_2_purpose',
-      'voice_3_resistance',
-      'voice_4_commitmentReading',
+      'voice_3_reconnectionAnchor',
+      'voice_4_commitment',
     ]);
     expect(res.body.captureReceipt.map((r) => r.voiceAttemptId)).toEqual(voiceAttemptIds);
     expect(res.body.sessionId).toBeTruthy();
@@ -314,24 +315,28 @@ describe('POST /api/onboarding/voice-bundle', () => {
       providerJobId: res.body.sessionId,
     });
     expect(res.body.mergedVoiceArtifact.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(res.body.mergedVoiceArtifact.validAudioDurationMs).toBe(40200);
+    expect(res.body.mergedVoiceArtifact.validationPassed).toBe(true);
     expect(res.body.voiceDebug.sampleCount).toBe(1);
     expect(res.body.voiceDebug.sourceSampleCount).toBe(4);
     expect(res.body.voiceDebug.mergedVoiceArtifact.sha256).toBe(res.body.mergedVoiceArtifact.sha256);
     expect(res.body.voiceDebug.answerMeta.bundleId).toBe(bundleId);
     expect(res.body.voiceDebug.answerMeta.voiceAttemptIds).toEqual(voiceAttemptIds);
-    expect(res.body.context.goal).toMatch(/choose the work/i);
-    expect(res.body.context.vision).toMatch(/remember the purpose/i);
-    expect(res.body.context.blocker).toMatch(/face resistance/i);
-    expect(res.body.context.commitmentReading).toMatch(/commit out loud/i);
+    expect(res.body.context.goal.text).toMatch(/choose the work/i);
+    expect(res.body.context.purpose.text).toMatch(/remember the purpose/i);
+    expect(res.body.context.reconnectionAnchor.text).toMatch(/face resistance/i);
+    expect(JSON.stringify(res.body.context)).not.toMatch(/commitment|journal/i);
 
     const manifestPath = path.join(TEST_UPLOADS, `voice_manifest_${res.body.sessionId}.json`);
     expect(fs.existsSync(manifestPath)).toBe(true);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-    expect(manifest.schemaVersion).toBe('alzo.voice_manifest.v2');
+    expect(manifest.schemaVersion).toBe('alzo.voice_manifest.r2.v1');
+    expect(manifest.voiceOwnerId).toBe(userId);
     expect(manifest.sourceCaptureFiles).toHaveLength(4);
     expect(manifest.providerFiles).toHaveLength(1);
     expect(manifest.mergedVoiceArtifact.sha256).toBe(res.body.mergedVoiceArtifact.sha256);
+    expect(manifest.semanticContext).toEqual(res.body.semanticContext);
     for (const persisted of [...manifest.sourceCaptureFiles, ...manifest.providerFiles]) {
       expect(fs.existsSync(persisted)).toBe(true);
     }

@@ -27,6 +27,7 @@ const voiceValidator = require("./backend/voice_validator");
 // qa-mock-tts kill switch: QA/Maestro/internal-build users get a static silent
 // MP3 instead of an ElevenLabs call. Saves quota; see lib/qa-mock-tts.js.
 const qaMockTts = require("./lib/qa-mock-tts");
+const alzoR2 = require("./lib/alzo-r2-contracts");
 // P0 (B53 REVENUE BLINDNESS): 6-event funnel helper. logEvent fires stdout +
 // Sentry breadcrumb + (for revenue-critical names) Sentry captureMessage.
 // See vault audits/2026-05-18-alzo-p0-analytics-observability.md.
@@ -479,149 +480,53 @@ function _validateAffirmationResponse(resp, model, retry_used) {
   };
 }
 
-async function generateAffirmation(context, language) {
-  const { goal, goal90, mood, intro, weekGoal, bigGoal, whyItMatters, weeklyGoal, weekFocus, identity, blocker, vision, strength } = context;
-
-  const contextBlock = [
-    (bigGoal || goal90) && `🎯 90-DAY GOAL: ${bigGoal || goal90}`,
-    (weekGoal || weeklyGoal || weekFocus) && `⭐ THIS WEEK'S FOCUS (most important): ${weekGoal || weeklyGoal || weekFocus}`,
-    whyItMatters && `Why it matters (emotional fuel): ${whyItMatters}`,
-    intro && `Who they are (extract name from this): ${intro}`,
-    (vision || goal || goal90) && `Long-term: ${vision || goal || goal90}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  // Default to English — never auto-detect from context
-  const langInstruction = LANGUAGE_INSTRUCTIONS[language] || LANGUAGE_INSTRUCTIONS['en-US'];
-
-  const systemPrompt = `You are a FIRE personal coach writing a 10-15 second POWER affirmation for ALZO. It plays in the user's cloned voice every morning. It must hit like a punch — short, raw, electric.
-
-YOUR JOB: Make them feel UNSTOPPABLE in under 30 words. No filler. No fluff. Every word earns its place.
-
-FORMULA (follow exactly, in order):
-1. [Name] + ONE powerful identity line (5 words max, from their intro)
-2. This week's goal as DONE DEAL — "you WILL", not "you want"
-3. ONE reason why it matters (emotional, raw, 6 words max)
-4. 3-4 word CLOSER that hits hard
-
-EXAMPLE OUTPUT:
-"Nacho. You build what doesn't exist yet.
-This week, ALZO hits its first users. Done.
-Because one app changes everything.
-Now move."
-
-ANOTHER EXAMPLE:
-"Sarah. You don't quit.
-This week: 10 clients locked in.
-Your future self is watching.
-Go."
-
-TONE RULES based on mood:
-- "on_track": fire, momentum, "keep crushing"
-- "need_push": aggressive, wake-up call, "no more excuses"
-- "pivoting": resilient, "adapt and dominate"
-- default: raw energy, unshakable confidence
-
-HARD RULES:
-- MAX 30 words. Non-negotiable. THIRTY WORDS MAX.
-- ONLY second person: "You", "Your" — NEVER "I am"
-- Ultra short sentences. 3-7 words each.
-- Extract name from intro if mentioned
-- Fix brand names: "also" = "ALZO"
-- NEVER: universe, manifest, journey, abundance, vibration, greatness, pushing
-
-CRITICAL LANGUAGE RULE: ${langInstruction} This is non-negotiable.`;
-
-  const userPrompt = `Generate the daily affirmation.
-
-Context:
-${contextBlock}
-
-Mood today: ${mood || "default"}
-
-Output only the affirmation text. No quotes, no labels, no explanations.
-Language: ${langInstruction}`;
-
-  // ─── Attempt 1: standard call ──────────────────────────────────────
-  let resp1;
-  try {
-    resp1 = await openai.chat.completions.create({
-      model: _DEFAULT_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.85,
-      max_tokens: 500,
-    });
-  } catch (e) {
-    Sentry.captureException(e, {
-      tags: { area: "affirmation", attempt: "1", model: _DEFAULT_MODEL },
-    });
-    resp1 = null;
+async function generateAffirmation(context, language, messageKind = 'first') {
+  if (language && !String(language).toLowerCase().startsWith('en')) {
+    const error = new Error('r2_english_only');
+    error.code = 'R2_ENGLISH_ONLY';
+    throw error;
   }
-  const v1 = _validateAffirmationResponse(resp1, _DEFAULT_MODEL, false);
-  if (v1.ok) return v1.text;
+  const prompt = messageKind === 'daily'
+    ? alzoR2.buildDailyPrompt(context)
+    : alzoR2.buildFirstPrompt(context);
 
-  // ─── Attempt 2: stricter prompt + lower temperature ────────────────
+  async function attempt(messages, retryUsed, temperature) {
+    let response = null;
+    try {
+      response = await openai.chat.completions.create({
+        model: _DEFAULT_MODEL,
+        messages,
+        temperature,
+        max_tokens: 500,
+      });
+    } catch (error) {
+      Sentry.captureException(error, { tags: { area: `${messageKind}_message`, attempt: retryUsed ? '2' : '1', model: _DEFAULT_MODEL } });
+    }
+    const transport = _validateAffirmationResponse(response, _DEFAULT_MODEL, retryUsed);
+    const policy = alzoR2.validateMessageText(transport.text || '');
+    return { ok: transport.ok && policy.ok, transport, policy };
+  }
+
+  const first = await attempt(prompt.messages, false, 0.35);
+  if (first.ok) return first.policy.text;
+
   Sentry.addBreadcrumb({
-    category: "affirmation",
-    level: "warning",
-    message: "affirmation_validation_failed_retry",
-    data: {
-      reason: v1.validation_result,
-      content_length: v1.content_length,
-      word_count: v1.word_count,
-      reasoning_length: v1.reasoning_length,
-      model: _DEFAULT_MODEL,
-    },
+    category: `${messageKind}_message`,
+    level: 'warning',
+    message: `${messageKind}_message.pre_tts.failed`,
+    data: { failureCodes: first.policy.failureCodes, transport: first.transport.validation_result, promptVersion: prompt.promptVersion },
   });
-  const strictUser = `${userPrompt}
+  const retryMessages = prompt.messages.concat([{
+    role: 'user',
+    content: `Repair only these validation failures: ${first.policy.failureCodes.join(',') || first.transport.validation_result}. Stay strictly inside the original Goal, Purpose and Reconnection Anchor. Return plain message text only.`,
+  }]);
+  const second = await attempt(retryMessages, true, 0.15);
+  if (second.ok) return second.policy.text;
 
-IMPORTANT: Return the affirmation as PLAIN TEXT in the assistant message content. Do NOT return reasoning, thinking, JSON, code blocks, or empty content. Minimum 12 words across at least 2 short sentences.`;
-  let resp2;
-  try {
-    resp2 = await openai.chat.completions.create({
-      model: _DEFAULT_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: strictUser },
-      ],
-      temperature: 0.5,
-      max_tokens: 500,
-    });
-  } catch (e) {
-    Sentry.captureException(e, {
-      tags: { area: "affirmation", attempt: "2", model: _DEFAULT_MODEL },
-    });
-    resp2 = null;
-  }
-  const v2 = _validateAffirmationResponse(resp2, _DEFAULT_MODEL, true);
-  if (v2.ok) return v2.text;
-
-  // ─── Fallback: deterministic safe text long enough for TTS validator ─
-  Sentry.captureMessage("affirmation.fallback_used", {
-    level: "warning",
-    tags: { area: "affirmation", step: "fallback", model: _DEFAULT_MODEL },
-    extra: {
-      attempt1_result: v1.validation_result,
-      attempt2_result: v2.validation_result,
-      attempt1_reasoning_length: v1.reasoning_length,
-      attempt2_reasoning_length: v2.reasoning_length,
-    },
-  });
-  recordVoiceMetric("generate_affirmation", {
-    model_used: _DEFAULT_MODEL,
-    content_length: AFFIRMATION_FALLBACK.length,
-    reasoning_length: 0,
-    word_count: AFFIRMATION_FALLBACK.split(/\s+/).filter(Boolean).length,
-    sentence_count: (AFFIRMATION_FALLBACK.match(/[.!?]+/g) || []).length,
-    retry_used: true,
-    fallback_used: true,
-    validation_result: "fallback",
-  });
-  return AFFIRMATION_FALLBACK;
+  const error = new Error(`${messageKind}_message_generation_failed`);
+  error.code = messageKind === 'daily' ? 'DAILY_MESSAGE_GENERATION_FAILED' : 'FIRST_MESSAGE_GENERATION_FAILED';
+  error.failureCodes = [...new Set([...(first.policy.failureCodes || []), ...(second.policy.failureCodes || [])])];
+  throw error;
 }
 
 // ── ElevenLabs: clone voice and generate audio ───────────────────────
@@ -800,7 +705,7 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
   if (existingVoiceId) {
     debug.customVoiceId = existingVoiceId;
     debug.playbackVoiceId = existingVoiceId;
-    debug.cloneMode = 'reused';
+    debug.cloneMode = 'cached';
     try {
       const speech = await withTimeout(generateSpeech(text, existingVoiceId, language), 30000);
       if (!speech || !speech.audioUrl) {
@@ -1142,6 +1047,9 @@ const onboardingUpload = upload.fields([
 const preAccountVoiceBundleUpload = upload.fields([
   { name: "voice_1_goal", maxCount: 1 },
   { name: "voice_2_purpose", maxCount: 1 },
+  { name: "voice_3_reconnectionAnchor", maxCount: 1 },
+  { name: "voice_4_commitment", maxCount: 1 },
+  // Request compatibility only; R2 responses and new mobile payloads use canonical names.
   { name: "voice_3_resistance", maxCount: 1 },
   { name: "voice_4_commitmentReading", maxCount: 1 },
 ]);
@@ -1174,7 +1082,7 @@ function runExecFile(command, args, options = {}) {
   });
 }
 
-async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceipt, voiceAttemptIds }) {
+async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceipt, voiceAttemptIds, orderedCaptureKinds, provenanceComplete }) {
   const files = (sourceFiles || []).filter(Boolean);
   if (files.length !== 4) {
     return { ok: false, error: 'merged_voice_source_count_required', expected: 4, actual: files.length };
@@ -1220,6 +1128,7 @@ async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceip
   }
 
   const sha256 = crypto.createHash('sha256').update(fs.readFileSync(mergedPath)).digest('hex');
+  Sentry.addBreadcrumb({ category: 'voice.bundle', level: 'info', message: 'voice.bundle.validation.started', data: { bundleIdHash: alzoR2.sha256(sessionId), sourceCount: files.length } });
   const validator = await voiceValidator.validateInputSample(mergedPath);
   if (!validator.ok) {
     try { fs.unlinkSync(mergedPath); } catch {}
@@ -1233,6 +1142,34 @@ async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceip
     };
   }
 
+  const mergedDurationMs = Number.isFinite(validator.duration) ? Math.round(validator.duration * 1000) : 0;
+  const qualityGate = alzoR2.validateTrainingBundle({
+    mergedDurationMs,
+    validAudioDurationMs: mergedDurationMs,
+    humanVoicePresent: validator.soft !== true && Number(validator.peak) >= voiceValidator.THRESHOLDS.MIN_PEAK_AMPLITUDE,
+    silencePredominant: Number(validator.peak) < voiceValidator.THRESHOLDS.MIN_PEAK_AMPLITUDE,
+    noisePredominant: (captureReceipt || []).some((item) => item.signalClass === 'noise_predominant'),
+    sourceCount: files.length,
+    providerFileCount: 1,
+    provenanceComplete: provenanceComplete === true,
+    orderedCaptureKinds,
+  });
+  if (!qualityGate.ok) {
+    try { fs.unlinkSync(mergedPath); } catch {}
+    Sentry.addBreadcrumb({ category: 'voice.bundle', level: 'warning', message: 'voice.bundle.validation.blocked', data: { failureCodes: qualityGate.failureCodes, mergedDurationMs, minimumDurationMs: qualityGate.minimumDurationMs } });
+    Sentry.addBreadcrumb({ category: 'voice.bundle', level: 'warning', message: 'voice.bundle.recovery.required', data: { recoveryKind: qualityGate.recoveryKind, failureCodes: qualityGate.failureCodes, minimumDurationMs: qualityGate.minimumDurationMs, currentValidDurationMs: mergedDurationMs } });
+    return {
+      ok: false,
+      error: 'voice_bundle_quality_gate_blocked',
+      code: qualityGate.failureCodes[0],
+      http: 422,
+      duration: validator.duration,
+      peak: validator.peak,
+      validation: qualityGate,
+    };
+  }
+  Sentry.addBreadcrumb({ category: 'voice.bundle', level: 'info', message: 'voice.bundle.validation.passed', data: { mergedDurationMs, validAudioDurationMs: mergedDurationMs, humanVoicePresent: true, silencePredominant: false, noisePredominant: false, sourceCount: 4, providerFileCount: 1, provenanceComplete: true } });
+
   return {
     ok: true,
     path: mergedPath,
@@ -1243,6 +1180,10 @@ async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceip
       captureIds: sourceCaptureIds,
       voiceAttemptIds: Array.isArray(voiceAttemptIds) ? voiceAttemptIds : [],
       totalDurationSeconds: validator.duration || null,
+      mergedDurationMs,
+      validAudioDurationMs: mergedDurationMs,
+      validationPassed: true,
+      minimumDurationMs: alzoR2.MIN_VALID_AUDIO_MS,
       peak: validator.peak || null,
       sha256,
       providerJobId: sessionId,
@@ -1265,6 +1206,31 @@ function parseVoiceManifest(raw) {
     };
   }
   return { providerFiles: [], sourceCaptureFiles: [], mergedVoiceArtifact: null, legacyArray: false };
+}
+
+function findLatestValidatedR2MergedVoiceForUser(userId) {
+  if (!userId || !fs.existsSync(UPLOAD_STORAGE_DIR)) return null;
+  const candidates = [];
+  for (const filename of fs.readdirSync(UPLOAD_STORAGE_DIR)) {
+    if (!/^voice_manifest_.+\.json$/.test(filename)) continue;
+    const manifestPath = path.join(UPLOAD_STORAGE_DIR, filename);
+    try {
+      const raw = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      if (raw.schemaVersion !== 'alzo.voice_manifest.r2.v1') continue;
+      if (raw.voiceOwnerId !== userId) continue;
+      if (raw.mergedVoiceArtifact?.validationPassed !== true) continue;
+      if (Number(raw.mergedVoiceArtifact?.validAudioDurationMs) < alzoR2.MIN_VALID_AUDIO_MS) continue;
+      if (!Array.isArray(raw.providerFiles) || raw.providerFiles.length !== 1) continue;
+      const providerFile = raw.providerFiles[0];
+      if (!providerFile || !fs.existsSync(providerFile)) continue;
+      candidates.push({
+        providerFile,
+        createdAt: Date.parse(raw.mergedVoiceArtifact?.createdAt || '') || fs.statSync(manifestPath).mtimeMs,
+      });
+    } catch {}
+  }
+  candidates.sort((a, b) => b.createdAt - a.createdAt);
+  return candidates[0]?.providerFile || null;
 }
 
 // ── Transcribe audio with Whisper ────────────────────────────────────
@@ -1338,7 +1304,7 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
     const preAccountVoiceBundle = parseJsonBodyField(req.body.preAccountVoiceBundle, null);
     const voiceProcessingPayload = parseJsonBodyField(req.body.voiceProcessingPayload, null);
     const productProvenance = parseJsonBodyField(req.body.productProvenance, voiceProcessingPayload?.productProvenance || null);
-    const semanticCaptureOrder = parseJsonBodyField(req.body.semanticCaptureOrder, ['goal', 'purpose', 'resistance', 'commitmentReading']);
+    const semanticCaptureOrder = parseJsonBodyField(req.body.semanticCaptureOrder, alzoR2.CAPTURE_ORDER);
     const voiceAttemptIds = parseJsonBodyField(req.body.voiceAttemptIds, []);
     const answerMeta = {
       endpoint: 'voice-bundle',
@@ -1351,14 +1317,19 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       correlationId,
     };
 
+    if (JSON.stringify(semanticCaptureOrder) !== JSON.stringify(alzoR2.CAPTURE_ORDER)) {
+      return res.status(400).json({ error: 'voice_bundle_capture_order_invalid', required: alzoR2.CAPTURE_ORDER, actual: semanticCaptureOrder, requestId, correlationId });
+    }
+
     const captureSpecs = [
-      { stage: 'goal', part: 'voice_1_goal', contextKey: 'goal' },
-      { stage: 'purpose', part: 'voice_2_purpose', contextKey: 'vision' },
-      { stage: 'resistance', part: 'voice_3_resistance', contextKey: 'blocker' },
-      { stage: 'commitmentReading', part: 'voice_4_commitmentReading', contextKey: 'commitmentReading' },
+      { stage: 'goal', part: 'voice_1_goal', legacyPart: null },
+      { stage: 'purpose', part: 'voice_2_purpose', legacyPart: null },
+      { stage: 'reconnectionAnchor', part: 'voice_3_reconnectionAnchor', legacyPart: 'voice_3_resistance' },
+      { stage: 'commitment', part: 'voice_4_commitment', legacyPart: 'voice_4_commitmentReading' },
     ];
 
-    const missing = captureSpecs.filter((spec) => !req.files?.[spec.part]?.[0]).map((spec) => spec.part);
+    const uploadedFor = (spec) => req.files?.[spec.part]?.[0] || (spec.legacyPart ? req.files?.[spec.legacyPart]?.[0] : null);
+    const missing = captureSpecs.filter((spec) => !uploadedFor(spec)).map((spec) => spec.part);
     if (missing.length > 0) {
       return res.status(400).json({
         error: 'voice_bundle_missing_required_captures',
@@ -1369,23 +1340,27 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       });
     }
 
-    const context = { blocker: "", vision: "", goal: "", commitmentReading: "" };
+    const transcriptByStage = {};
     const audioFiles = [];
     const transcriptions = [];
     const captureReceipt = [];
+    const provenanceCaptures = Array.isArray(productProvenance?.captures) ? productProvenance.captures : [];
 
     for (const spec of captureSpecs) {
-      const uploaded = req.files[spec.part][0];
+      const uploaded = uploadedFor(spec);
       const filePath = uploaded.path;
       audioFiles.push(filePath);
       const transcription = await transcribeAudio(filePath, language);
       if (transcription && transcription.trim().length > 5) {
-        context[spec.contextKey] = transcription;
+        transcriptByStage[spec.stage] = transcription;
         transcriptions.push(transcription);
       }
+      const provenance = provenanceCaptures.find((item) => item.stage === spec.stage || (spec.stage === 'reconnectionAnchor' && item.stage === 'resistance') || (spec.stage === 'commitment' && item.stage === 'commitmentReading')) || {};
       captureReceipt.push({
         stage: spec.stage,
         partName: spec.part,
+        captureId: provenance.captureId || null,
+        signalClass: provenance.signalClass || 'human_voice_detected',
         voiceAttemptId: Array.isArray(voiceAttemptIds)
           ? voiceAttemptIds[captureReceipt.length] || null
           : (voiceAttemptIds && voiceAttemptIds[spec.stage]) || null,
@@ -1396,7 +1371,18 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       });
     }
 
-    const detectedGender = await detectGender(transcriptions);
+    const semanticExtraction = alzoR2.buildSemanticExtraction({
+      goal: { ...provenanceCaptures.find((item) => item.stage === 'goal'), transcript: transcriptByStage.goal, goalConcrete: true },
+      purpose: { ...provenanceCaptures.find((item) => item.stage === 'purpose'), transcript: transcriptByStage.purpose },
+      reconnectionAnchor: { ...provenanceCaptures.find((item) => item.stage === 'reconnectionAnchor' || item.stage === 'resistance'), transcript: transcriptByStage.reconnectionAnchor },
+    });
+    if (semanticExtraction.status !== 'ready') {
+      audioFiles.forEach((file) => { try { fs.unlinkSync(file); } catch {} });
+      Sentry.addBreadcrumb({ category: 'voice.semantic', level: 'warning', message: 'voice.semantic_extraction.failed', data: { blockingCaptureKinds: semanticExtraction.assessments.filter((item) => item.disposition === 'rerecord').map((item) => item.captureKind), reasonCodes: semanticExtraction.assessments.map((item) => item.reasonCode) } });
+      return res.status(422).json({ error: 'semantic_extraction_rerecord_required', semanticExtraction, requestId, correlationId });
+    }
+    Sentry.addBreadcrumb({ category: 'voice.semantic', level: 'info', message: 'voice.semantic_extraction.completed', data: { semanticContextSha256: semanticExtraction.semanticContextSha256, dispositions: semanticExtraction.assessments.map((item) => `${item.captureKind}:${item.disposition}`) } });
+    const detectedGender = await detectGender([transcriptByStage.goal, transcriptByStage.purpose, transcriptByStage.reconnectionAnchor].filter(Boolean));
 
     const sessionId = Date.now().toString();
     const voiceOwnerId = safeVoiceOwnerId(user.id);
@@ -1413,6 +1399,8 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       sourceFiles: persistedVoiceFiles,
       captureReceipt,
       voiceAttemptIds,
+      orderedCaptureKinds: semanticCaptureOrder,
+      provenanceComplete: captureReceipt.every((item) => item.captureId && item.voiceAttemptId),
     });
     if (!mergeResult.ok) {
       audioFiles.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });
@@ -1441,10 +1429,15 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       }
       const voiceManifest = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
       fs.writeFileSync(voiceManifest, JSON.stringify({
-        schemaVersion: 'alzo.voice_manifest.v2',
+        schemaVersion: 'alzo.voice_manifest.r2.v1',
+        voiceOwnerId,
         providerFiles: providerVoiceFiles,
         sourceCaptureFiles: persistedVoiceFiles,
         mergedVoiceArtifact: mergeResult.artifact,
+        semanticCaptureOrder,
+        semanticContext: semanticExtraction.semanticContext,
+        semanticContextSha256: semanticExtraction.semanticContextSha256,
+        provenanceComplete: captureReceipt.every((item) => item.captureId && item.voiceAttemptId),
       }));
     }
     audioFiles.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });
@@ -1491,7 +1484,9 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       preAccountVoiceBundleAccepted: Boolean(preAccountVoiceBundle),
       voiceProcessingPayloadAccepted: Boolean(voiceProcessingPayload),
       captureReceipt,
-      context,
+      context: semanticExtraction.semanticContext,
+      semanticContext: semanticExtraction.semanticContext,
+      semanticExtraction,
       detectedGender,
       language,
       voiceReady: Boolean(persistedVoiceFiles.length && ELEVENLABS_API_KEY),
@@ -1515,6 +1510,11 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
 
 app.post("/api/onboarding", onboardingUpload, async (req, res) => {
   try {
+    return res.status(410).json({
+      error: 'legacy_onboarding_disabled_use_r2_voice_bundle',
+      canonicalEndpoint: '/api/onboarding/voice-bundle',
+    });
+    /* istanbul ignore next -- superseded R1 implementation retained temporarily for rollback archaeology only. */
     const language = req.body.language || 'en-US';
     const answerMeta = (() => { try { return JSON.parse(req.body.answerMeta || '{}'); } catch { return {}; } })();
 
@@ -1657,6 +1657,23 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     if (!context) {
       return res.status(400).json({ error: "Context is required" });
     }
+    if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+    const manifestPath = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
+    let r2Manifest = null;
+    try { r2Manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch {}
+    const manifestGate = r2Manifest
+      && r2Manifest.schemaVersion === 'alzo.voice_manifest.r2.v1'
+      && r2Manifest.mergedVoiceArtifact?.validationPassed === true
+      && Number(r2Manifest.mergedVoiceArtifact?.validAudioDurationMs) >= alzoR2.MIN_VALID_AUDIO_MS
+      && Array.isArray(r2Manifest.providerFiles)
+      && r2Manifest.providerFiles.length === 1
+      && r2Manifest.provenanceComplete === true
+      && JSON.stringify(r2Manifest.semanticCaptureOrder) === JSON.stringify(alzoR2.CAPTURE_ORDER)
+      && r2Manifest.semanticContext;
+    if (!manifestGate) {
+      return res.status(422).json({ error: 'r2_bundle_validation_required_before_first_message', sessionId });
+    }
+    const authoritativeContext = r2Manifest.semanticContext;
 
     // ── QA kill switch ────────────────────────────────────────────────
     // Short-circuit BEFORE generating text + voice for QA/Maestro/internal
@@ -1678,82 +1695,26 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       }
     }
 
-    // 1. Generate affirmation text
-    const affirmationText = await generateAffirmation(context, language);
+    // 1. Generate the source-grounded First Message from manifest context only.
+    Sentry.addBreadcrumb({ category: 'first_message', level: 'info', message: 'first_message.generation.started', data: { semanticContextSha256: r2Manifest.semanticContextSha256 } });
+    const affirmationText = await generateAffirmation(authoritativeContext, language, 'first');
 
-    // 2. Generate audio — use all voice samples if available
+    // 2. Generate audio — use the single R2 merged training artifact only.
     let audioUrl = null;
     let voiceDebug = { cloneMode: 'not_ready', fallbackUsed: false, error: null };
-    const manifestPath = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
 
-    // ── Voice-sample lookup cascade ────────────────────────────────────
-    // Onboarding's multi-sample upload persists files under several naming
-    // schemes. Resolving ONLY the legacy single-file path silently dropped
-    // multi-sample users to textToSpeechFallback(). Try, in priority order:
-    //   1. legacy   voice_<sessionId>.{m4a,webm}
-    //   2. sessionScoped  voice_<sessionId>_<N>.{m4a,webm}  (highest N)
-    //   3. userScopedSession  voice_user_<userId>_<sessionId>.{m4a,webm}
-    //   4. userScopedGeneric  voice_user_<userId>_*.{m4a,webm}  (last resort —
-    //      may pick up an OLD sample, so it is logged explicitly).
+    // R2 Final: First Message may use only the single merged artifact sealed in
+    // the validated server manifest. No legacy/session/user-generic fallback.
     const authedUser = getUserByToken(req);
     const lookupUserId = authedUser ? authedUser.id : null;
-    const safeUserId = lookupUserId ? String(lookupUserId).replace(/[^a-zA-Z0-9_-]/g, '') : null;
-
-    let voicePath = null;
-    let voiceLookupMethod = 'none';
-    try {
-      const exts = ['m4a', 'webm'];
-      // 1. legacy
-      for (const ext of exts) {
-        const p = path.join(UPLOAD_STORAGE_DIR, `voice_${sessionId}.${ext}`);
-        if (fs.existsSync(p)) { voicePath = p; voiceLookupMethod = 'legacy'; break; }
-      }
-      // 2. sessionScoped multi-sample (highest N / newest)
-      if (!voicePath) {
-        const re = new RegExp(`^voice_${sessionId}_(\\d+)\\.(m4a|webm)$`);
-        const sessionScoped = fs.readdirSync(UPLOAD_STORAGE_DIR)
-          .filter((f) => re.test(f))
-          .sort((a, b) => (parseInt(a.match(re)[1], 10) - parseInt(b.match(re)[1], 10)))
-          .reverse();
-        if (sessionScoped[0]) {
-          voicePath = path.join(UPLOAD_STORAGE_DIR, sessionScoped[0]);
-          voiceLookupMethod = 'sessionScoped';
-        }
-      }
-      // 3. userScopedSession — voice_user_<userId>_<sessionId>.{m4a,webm}
-      if (!voicePath && safeUserId) {
-        for (const ext of exts) {
-          const p = path.join(UPLOAD_STORAGE_DIR, `voice_user_${safeUserId}_${sessionId}.${ext}`);
-          if (fs.existsSync(p)) { voicePath = p; voiceLookupMethod = 'userScopedSession'; break; }
-        }
-      }
-      // 4. userScopedGeneric — last resort, may be an OLD sample
-      if (!voicePath && safeUserId) {
-        const generic = fs.readdirSync(UPLOAD_STORAGE_DIR)
-          .filter((f) => f.startsWith(`voice_user_${safeUserId}_`) && /\.(m4a|webm)$/.test(f))
-          .sort()
-          .reverse();
-        if (generic[0]) {
-          voicePath = path.join(UPLOAD_STORAGE_DIR, generic[0]);
-          voiceLookupMethod = 'userScopedGeneric';
-        }
-      }
-    } catch (lookupErr) {
-      console.error('[generate-affirmation] voice-lookup error:', lookupErr);
+    let voicePath = r2Manifest.providerFiles[0];
+    let voiceLookupMethod = 'r2Manifest';
+    if (!voicePath || !fs.existsSync(voicePath)) {
+      return res.status(422).json({ error: 'r2_merged_artifact_missing', sessionId });
     }
 
     console.log(`[generate-affirmation] voice-lookup method=${voiceLookupMethod} ` +
-      `file=${voicePath ? path.basename(voicePath) : 'null'} ` +
-      `sessionId=${sessionId} userId=${lookupUserId || 'null'}`);
-    if (voiceLookupMethod === 'userScopedGeneric') {
-      console.warn(`[generate-affirmation] WARNING: voice resolved via userScopedGeneric ` +
-        `for userId=${lookupUserId} — generic match may be a stale/older sample.`);
-      Sentry.captureMessage('generate_affirmation.voice_lookup_generic', {
-        level: 'warning',
-        tags: { component: 'voice_lookup', endpoint: 'generate_affirmation', lookupMethod: 'userScopedGeneric' },
-        extra: { userId: lookupUserId, sessionId, file: path.basename(voicePath) },
-      });
-    }
+      `file=${path.basename(voicePath)} sessionId=${sessionId} userId=${lookupUserId || 'null'}`);
 
     if (sessionId && voicePath) {
       // Check for a cached ElevenLabs voice_id on the authenticated user.
@@ -1907,56 +1868,50 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
     }
 
     if (!context) {
-      return res.status(400).json({ error: "Context is required for first-of-day generation" });
+      return res.status(400).json({ error: "R2 Daily context is required for first-of-day generation" });
     }
 
-    // Generate text
-    const affirmationText = await generateAffirmation(context, language);
-
-    // Generate audio — prefer cached voice_id, fall back to clone, fall back to preset
-    let audioUrl = null;
-    let voiceMode = "preset";
     const cachedRow = stmts.getVoiceId.get(user.id);
     const cachedVoiceId = cachedRow?.elevenlabsVoiceId || null;
-
-    // Find this user's retained sample for re-clone fallback. Prefer user-scoped
-    // files; only fall back to legacy session-only files for old pre-fix users.
-    const uploadsDir = UPLOAD_STORAGE_DIR;
-    const safeUserId = String(user.id).replace(/[^a-zA-Z0-9_-]/g, '');
-    const userVoiceCandidates = fs.readdirSync(uploadsDir)
-      .filter((f) => f.startsWith(`voice_user_${safeUserId}_`) && /\.(m4a|webm)$/.test(f))
-      .sort()
-      .reverse();
-    const legacyVoiceCandidates = fs.readdirSync(uploadsDir)
-      .filter((f) => /^voice_\d+\.(m4a|webm)$/.test(f))
-      .sort()
-      .reverse();
-    const voiceCandidate = userVoiceCandidates[0] || legacyVoiceCandidates[0] || null;
-    const voicePath = voiceCandidate ? path.join(uploadsDir, voiceCandidate) : null;
-
-    if (ELEVENLABS_API_KEY && (cachedVoiceId || voicePath)) {
-      const cloneResult = await cloneVoiceAndSpeak(
-        affirmationText,
-        voicePath,
-        detectedGender,
-        language,
-        cachedVoiceId,
-      );
-      audioUrl = cloneResult.audioUrl;
-      voiceMode = cloneResult.voiceDebug.cloneMode || "unknown";
-      if (cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
-        stmts.setVoiceId.run(cloneResult.voiceId, user.id);
-      } else if (cachedVoiceId && cloneResult.voiceDebug?.staleCachedVoiceId && !cloneResult.voiceId) {
-        stmts.setVoiceId.run(null, user.id);
-        recordVoiceMetric('stale_cached_voice_cleared', { userId: user.id, voiceId: cachedVoiceId, endpoint: 'affirmation_today' });
-      }
+    if (!cachedVoiceId) {
+      return res.status(409).json({ error: 'verified_self_voice_required_for_daily', code: 'SELF_VOICE_REQUIRED' });
     }
 
-    if (!audioUrl) {
-      const fallback = await textToSpeechFallback(affirmationText, detectedGender, language);
-      audioUrl = fallback.audioUrl;
-      voiceMode = fallback.voiceDebug.cloneMode || "preset";
+    const dailyPrompt = alzoR2.buildDailyPrompt(context);
+    Sentry.addBreadcrumb({
+      category: 'daily_message',
+      level: 'info',
+      message: 'daily_context.built',
+      data: {
+        contextSha256: alzoR2.sha256(JSON.stringify(dailyPrompt.semanticContext)),
+        historyAvailableCount: Array.isArray(context.recentDailyMessages || context.dailyHistory) ? (context.recentDailyMessages || context.dailyHistory).length : 0,
+        historyReviewedCount: dailyPrompt.historyReviewedIds.length,
+        firstMessageReferencePresent: Boolean(context.firstMessageReference),
+      },
+    });
+    const affirmationText = await generateAffirmation(context, language, 'daily');
+
+    const retainedMergedVoice = findLatestValidatedR2MergedVoiceForUser(user.id);
+    const cloneResult = await cloneVoiceAndSpeak(
+      affirmationText,
+      retainedMergedVoice,
+      detectedGender,
+      language,
+      cachedVoiceId,
+    );
+    const dailyVoiceMode = cloneResult.voiceDebug?.cloneMode;
+    const validCachedTts = dailyVoiceMode === 'cached';
+    const validStaleReclone = dailyVoiceMode === 'cloned' && cloneResult.voiceDebug?.staleVoiceReclone === true;
+    if (cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
+      stmts.setVoiceId.run(cloneResult.voiceId, user.id);
+    } else if (cloneResult.voiceDebug?.staleCachedVoiceId && !cloneResult.voiceId) {
+      stmts.setVoiceId.run(null, user.id);
     }
+    if (!cloneResult.audioUrl || (!validCachedTts && !validStaleReclone)) {
+      return res.status(502).json({ error: 'daily_self_voice_tts_failed', voiceDebug: cloneResult.voiceDebug });
+    }
+    const audioUrl = cloneResult.audioUrl;
+    const voiceMode = validStaleReclone ? 'recloned' : 'cached';
 
     const id = crypto.randomBytes(12).toString("hex");
     try {
@@ -2776,7 +2731,7 @@ app.post("/api/goals/:id/complete", async (req, res) => {
     const plants = stmts.getActivePlants.all(user.id);
     const goalPlant = plants.find(p => p.goalId === goal.id);
     const checkins = stmts.getRecentCheckins.all(user.id, 90);
-    const alignedDays = checkins.filter(c => c.alignment === 'yes' || c.alignment === 'mostly').length;
+
 
     const chronicleRes = await openai.chat.completions.create({
       model: _DEFAULT_MODEL,
@@ -2790,8 +2745,7 @@ app.post("/api/goals/:id/complete", async (req, res) => {
           content: `Write a chronicle for completing this goal.
 Name: ${user.name || 'User'}
 Goal: ${goal.description}
-Days active: ${checkins.length}
-Aligned days: ${alignedDays}
+Days with check-ins: ${checkins.length}
 Plant: ${goalPlant?.species || 'unknown'} named "${goalPlant?.name || 'companion'}"`
         }
       ],
@@ -2823,36 +2777,26 @@ app.post("/api/checkin", async (req, res) => {
   const user = getUserByToken(req);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
   const { goalId, intentionConfirmed, emotionalState, energyLevel, alignment, microcommitment } = req.body;
-  const id = crypto.randomUUID();
-  stmts.insertCheckin.run(id, user.id, goalId, intentionConfirmed ? 1 : 0, emotionalState, energyLevel || 3, alignment, microcommitment);
-
-  // Decay plants that haven't been checked in (subtle withering)
-  decayPlantHealth(user.id);
-
-  // Update plant health based on alignment
-  const plants = stmts.getActivePlants.all(user.id);
-  for (const plant of plants) {
-    if (plant.goalId === goalId || !goalId) {
-      let healthDelta = 0;
-      let growthDelta = 0;
-      if (alignment === 'yes') { healthDelta = 0.05; growthDelta = 0.02; }
-      else if (alignment === 'mostly') { healthDelta = 0.02; growthDelta = 0.01; }
-      else if (alignment === 'no') { healthDelta = -0.02; growthDelta = 0; }
-      else if (alignment === 'avoided') { healthDelta = -0.04; growthDelta = 0; }
-      const newHealth = Math.max(0, Math.min(1, plant.health + healthDelta));
-      const newGrowth = Math.min(1, plant.growthStage + growthDelta);
-      stmts.updatePlantHealth.run(newHealth, newGrowth, plant.id);
-    }
+  if (typeof alignment === 'number' || /^\s*\d+(?:\.\d+)?\s*$/.test(String(alignment || ''))) {
+    return res.status(400).json({ error: 'alignment_must_be_emotional_relationship_not_numeric_score' });
   }
+  const id = crypto.randomUUID();
+  stmts.insertCheckin.run(id, user.id, goalId, intentionConfirmed ? 1 : 0, emotionalState || null, energyLevel ?? null, alignment || null, microcommitment || null);
 
-  // Update streak
-  db.prepare("UPDATE users SET streak = streak + 1 WHERE id = ?").run(user.id);
-
-  // Check for new milestones (async, don't block response)
-  const updatedUser = stmts.getByToken.get(user.token);
-  const newMilestones = await checkMilestones(updatedUser).catch(() => []);
-
-  res.json({ id, success: true, plantUpdated: plants.length > 0, newMilestones });
+  // R2 Final: submission records context only. Strike, streak and plant growth
+  // must wait for credible native Daily Message playback completion.
+  res.json({
+    id,
+    success: true,
+    status: 'awaiting_daily_playback',
+    alignmentSemantics: 'emotional_connection_only',
+    visibleNumericScore: false,
+    scoringEnabled: false,
+    plantUpdated: false,
+    strikeActivated: false,
+    growthAwaitingPlayback: true,
+    newMilestones: [],
+  });
 });
 
 app.get("/api/checkin/today", (req, res) => {
@@ -2872,10 +2816,7 @@ app.get("/api/mirror", (req, res) => {
   const primaryGoal = goals.find(g => g.type === 'long') || goals[0];
   const lastCheckin = recentCheckins[0];
 
-  // Calculate alignment score for the week
-  const alignedCount = recentCheckins.filter(c => c.alignment === 'yes' || c.alignment === 'mostly').length;
   const totalCheckins = recentCheckins.length;
-  const alignmentScore = totalCheckins > 0 ? Math.round((alignedCount / totalCheckins) * 100) : 0;
 
   // Determine dominant mood
   const moods = recentCheckins.map(c => c.emotionalState).filter(Boolean);
@@ -2888,7 +2829,9 @@ app.get("/api/mirror", (req, res) => {
     lastState: lastCheckin?.emotionalState || null,
     lastEnergy: lastCheckin?.energyLevel || null,
     lastAlignment: lastCheckin?.alignment || null,
-    alignmentScore,
+    alignmentSemantics: 'emotional_connection_only',
+    visibleNumericScore: false,
+    scoringEnabled: false,
     dominantMood,
     daysActive: totalCheckins,
     goalDaysRemaining: primaryGoal ? Math.max(0, Math.ceil((new Date(primaryGoal.targetDate) - Date.now()) / 86400000)) : null,
@@ -3001,7 +2944,7 @@ app.get("/api/plants/species", (req, res) => {
 // ── Milestone narrative generation ──────────────────────────────────
 async function generateMilestoneNarrative(user, milestone, goals, checkins) {
   const primaryGoal = goals.find(g => g.type === 'long') || goals[0];
-  const alignedDays = checkins.filter(c => c.alignment === 'yes' || c.alignment === 'mostly').length;
+
 
   const response = await openai.chat.completions.create({
     model: _DEFAULT_MODEL,
@@ -3016,7 +2959,7 @@ async function generateMilestoneNarrative(user, milestone, goals, checkins) {
 Name: ${user.name || 'User'}
 Milestone: ${milestone.type} (day ${milestone.dayNumber})
 Goal: ${primaryGoal?.description || 'personal growth'}
-Aligned days: ${alignedDays} out of ${checkins.length}
+Days with check-ins: ${checkins.length}
 Streak: ${user.streak}`
       }
     ],

@@ -37,6 +37,7 @@ const {
   FormData: UndiciFormData,
 } = require('undici');
 const request = require('supertest');
+const { r2SemanticContext, uploadR2VoiceBundle } = require('./helpers/r2-voice-bundle');
 
 // ── Force undici fetch so MockAgent can intercept SUT's `fetch()` calls ──────
 globalThis.fetch    = undiciFetch;
@@ -237,7 +238,7 @@ function installOpenAIMock(agent) {
       choices: [{
         index: 0,
         finish_reason: 'stop',
-        message: { role: 'assistant', content: 'You are unstoppable. Show up today.' },
+        message: { role: 'assistant', content: 'I am finishing the prototype because it supports my family. When it gets difficult, I remember why I began.' },
       }],
       usage: { prompt_tokens: 12, completion_tokens: 9, total_tokens: 21 },
     }))
@@ -269,63 +270,40 @@ describe('FLOW-40 — server-side E2E: voice pipeline full chain', () => {
    * Single test — all 6 chain steps executed sequentially inside one it() block
    * so failures pinpoint the exact step without cross-test state leakage.
    */
-  it('upload 3 clips → clone triggered → voice_id persisted → affirmation audioUrl returned → URL fetchable', async () => {
+  it('upload R2 four-capture bundle → First clone → voice_id persisted → Daily audioUrl returned → URL fetchable', async () => {
     // ── STEP 1: Authenticate a test user ──────────────────────────────────────
     const { email, token, status: signupStatus } = await registerUser();
     expect(signupStatus).toBe(200);
     expect(token).toBeTruthy();
     // STEP 1 PASS: user registered, JWT token obtained.
 
-    // ── STEP 2: POST 3 voice clips to /api/onboarding ─────────────────────────
-    // The endpoint accepts multipart fields: q1, q2 (question responses) +
-    // voiceSample (dedicated clone source). Using real fixture buffer.
-    const onboardingRes = await request(url())
-      .post('/api/onboarding')
-      .set('Authorization', `Bearer ${token}`)
-      .field('language', 'en-US')
-      .attach('q1', silentMp3Buffer(), { filename: 'q1.m4a', contentType: 'audio/mp4' })
-      .attach('q2', silentMp3Buffer(), { filename: 'q2.m4a', contentType: 'audio/mp4' })
-      .attach('voiceSample', silentMp3Buffer(), { filename: 'voice_sample.m4a', contentType: 'audio/mp4' });
-
-    // STEP 2 PASS: 200 + voiceDebug block present + samples accepted.
-    // NOTE: onboarding defers clone to the first affirmation call — cloneMode
-    // will be "pending" here (samples saved, clone not yet triggered).
+    // ── STEP 2: POST canonical R2 four-capture bundle ─────────────────────────
+    const onboardingRes = await uploadR2VoiceBundle({ request, baseUrl: url(), token });
     expect(onboardingRes.status).toBe(200);
-    expect(onboardingRes.body).toBeDefined();
-    const voiceDebug = onboardingRes.body.voiceDebug;
-    expect(voiceDebug).toBeTruthy();
-    // Samples were received and saved
-    expect(voiceDebug.sampleCount).toBeGreaterThanOrEqual(3);
-    // STEP 2 PASS: 3 clips accepted, sampleCount >= 3, samples persisted to disk.
+    expect(onboardingRes.body.fileCount).toBe(4);
+    expect(onboardingRes.body.providerFileCount).toBe(1);
+    expect(onboardingRes.body.mergedVoiceArtifact.validationPassed).toBe(true);
 
-    // ── STEP 5 (before Steps 3+4): Request affirmation — this triggers clone ──
-    // Architecture: clone is lazy — triggered on first affirmation request, not
-    // during onboarding. Steps 3 and 4 are therefore verified after this call.
-    const affRes = await request(url())
-      .post('/api/affirmation/today')
+    // ── STEP 3: Generate First Message; this is the only clone trigger ─────────
+    const firstRes = await request(url())
+      .post('/api/generate-affirmation')
       .set('Authorization', `Bearer ${token}`)
       .send({
-        context: {
-          blocker:  'fear of failure',
-          vision:   'launch ALZO worldwide',
-          goal:     'ship flow-40 clean',
-        },
-        language:               'en-US',
-        detectedGender:         'male',
-        timezoneOffsetMinutes:  240,
+        context: r2SemanticContext(),
+        sessionId: onboardingRes.body.sessionId,
+        language: 'en-US',
+        detectedGender: 'male',
       });
-
-    // STEP 5 PASS: 200 + audioUrl present
-    expect(affRes.status).toBe(200);
-    const audioUrl = affRes.body.audioUrl;
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.body.audioUrl).toBeTruthy();
 
     // ── STEP 3: Assert clone generation was triggered (ElevenLabs mock hit) ───
     // The mock intercepts POST /v1/voices/add and increments cloneCalls.
-    // This MUST be checked AFTER affirmation/today, which is the trigger point.
+    // This MUST be checked AFTER First Message, which is the clone trigger point.
     expect(elState.cloneCalls).toBeGreaterThanOrEqual(1);
-    const affVoiceDebug = affRes.body.voiceDebug;
-    if (affVoiceDebug) {
-      expect(['cloned', 'clone_reused'].some((m) => affVoiceDebug.cloneMode === m)).toBe(true);
+    const firstVoiceDebug = firstRes.body.voiceDebug;
+    if (firstVoiceDebug) {
+      expect(['cloned', 'clone_reused'].some((m) => firstVoiceDebug.cloneMode === m)).toBe(true);
     }
     // STEP 3 PASS: ElevenLabs POST /v1/voices/add intercepted (cloneCalls >= 1).
 
@@ -339,10 +317,22 @@ describe('FLOW-40 — server-side E2E: voice pipeline full chain', () => {
     // The stored voice_id must match the mock-generated pattern
     expect(row.elevenlabsVoiceId).toMatch(/voice_clone_f40_/);
     // STEP 4 PASS: voice_id written to users.elevenlabsVoiceId in SQLite.
+
+    // ── STEP 5: Daily Message is a separate generation using the cached voice ─
+    const dailyRes = await request(url())
+      .post('/api/affirmation/today')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        context: r2SemanticContext({ firstMessageReference: { id: 'first_r2_flow40', treatedSeparately: true } }),
+        language: 'en-US',
+        detectedGender: 'male',
+        timezoneOffsetMinutes: 240,
+      });
+    expect(dailyRes.status).toBe(200);
+    const audioUrl = dailyRes.body.audioUrl;
     expect(audioUrl).toBeTruthy();
     expect(typeof audioUrl).toBe('string');
     expect(audioUrl.length).toBeGreaterThan(0);
-    // STEP 5 PASS: /api/affirmation/today returned a non-empty audioUrl.
 
     // ── STEP 6: Fetch the playback URL and assert non-empty audio response ────
     const audioRes = await request(url()).get(audioUrl);

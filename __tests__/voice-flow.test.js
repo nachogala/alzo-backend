@@ -34,6 +34,7 @@ const net = require('net');
 const crypto = require('crypto');
 const { MockAgent, setGlobalDispatcher, fetch: undiciFetch, Headers: UndiciHeaders, Request: UndiciRequest, Response: UndiciResponse, FormData: UndiciFormData } = require('undici');
 const request = require('supertest');
+const { r2SemanticContext, uploadR2VoiceBundle } = require('./helpers/r2-voice-bundle');
 
 // CRITICAL: Jest replaces globalThis.fetch with its own (non-undici) implementation,
 // so setGlobalDispatcher() has no effect on `fetch()` calls inside the SUT.
@@ -305,7 +306,7 @@ function installOpenAIMock(agent) {
         {
           index: 0,
           finish_reason: 'stop',
-          message: { role: 'assistant', content: 'You are showing up. Keep going.' },
+          message: { role: 'assistant', content: 'I am finishing the prototype because it supports my family. When it gets difficult, I remember why I began.' },
         },
       ],
       usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 },
@@ -385,12 +386,9 @@ describe('TG2 — Voice survives ElevenLabs IVC expiry (re-clone path)', () => {
     const { email } = await registerUser();
     const token = await loginUser(email);
 
-    // Onboard so we have samples on disk + a fresh clone (NOT prefixed "expired_")
-    await request(url())
-      .post('/api/onboarding')
-      .set('Authorization', `Bearer ${token}`)
-      .field('language', 'en-US')
-      .attach('voiceSample', silentMp3Buffer(), 'sample.m4a');
+    // Upload the canonical four-capture R2 bundle so the re-clone path has a sealed merged artifact.
+    const onboarding = await uploadR2VoiceBundle({ request, baseUrl: url(), token });
+    expect(onboarding.status).toBe(200);
 
     // Manually poison the user's voice_id to one the mock will 404 on
     const Database = require('better-sqlite3');
@@ -408,13 +406,14 @@ describe('TG2 — Voice survives ElevenLabs IVC expiry (re-clone path)', () => {
       .post('/api/affirmation/today')
       .set('Authorization', `Bearer ${token}`)
       .send({
-        context: { blocker: 'doubt', vision: 'clarity', goal: 'finish' },
+        context: r2SemanticContext(),
         language: 'en-US',
         detectedGender: 'female',
         timezoneOffsetMinutes: 240,
       });
     expect(res.status).toBe(200);
     expect(res.body.audioUrl).toBeTruthy();
+    expect(res.body.voiceMode).toBe('recloned');
 
     // Confirm the user row now holds a non-expired voice_id
     const db2 = new Database(TEST_DB);
@@ -443,11 +442,7 @@ describe('TG3 — First-message self-voice gate', () => {
   test('100 concurrent /api/generate-affirmation requests without a usable sample are blocked, not fulfilled by fallback audio', async () => {
     const { email } = await registerUser();
     const token = await loginUser(email);
-    await request(url())
-      .post('/api/onboarding')
-      .set('Authorization', `Bearer ${token}`)
-      .field('language', 'en-US')
-      .attach('voiceSample', silentMp3Buffer(), 'sample.m4a');
+    // Do not upload a bundle: R2 must block every First Message request before generation/provider use.
 
     const N = 100;
     const calls = Array.from({ length: N }, () =>
@@ -455,22 +450,23 @@ describe('TG3 — First-message self-voice gate', () => {
         .post('/api/generate-affirmation')
         .set('Authorization', `Bearer ${token}`)
         .send({
-          context: { blocker: 'x', vision: 'y', goal: 'z' },
+          context: r2SemanticContext(),
+          sessionId: 'missing_r2_bundle',
           language: 'en-US',
         })
     );
     const results = await Promise.all(calls);
-    const blockedResults = results.filter((r) => r.status === 409 && r.body.code === 'VOICE_SAMPLE_REQUIRED');
+    const blockedResults = results.filter((r) => r.status === 422 && r.body.error === 'r2_bundle_validation_required_before_first_message');
     expect(blockedResults.length).toBe(N);
     expect(results.some((r) => r.status === 200 && r.body.audioUrl)).toBe(false); // no fallback-as-success for first message
   }, 60000);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TG4 — Onboarding sample retention
+// TG4 — Legacy onboarding retirement (R2 decision)
 // ─────────────────────────────────────────────────────────────────────────────
-describe('TG4 — Onboarding sample retention', () => {
-  test('POST /api/onboarding with 5 audios persists ALL 5 samples (no last-only deletion)', async () => {
+describe('TG4 — Legacy onboarding retirement', () => {
+  test('POST /api/onboarding is retired and points callers to the R2 bundle endpoint', async () => {
     const { email } = await registerUser();
     const token = await loginUser(email);
 
@@ -478,33 +474,11 @@ describe('TG4 — Onboarding sample retention', () => {
       .post('/api/onboarding')
       .set('Authorization', `Bearer ${token}`)
       .field('language', 'en-US')
-      .attach('q1', silentMp3Buffer(), 'q1.m4a')
-      .attach('q2', silentMp3Buffer(), 'q2.m4a')
-      .attach('q3', silentMp3Buffer(), 'q3.m4a')
-      .attach('q4', silentMp3Buffer(), 'q4.m4a')
       .attach('voiceSample', silentMp3Buffer(), 'sample.m4a');
 
-    expect(res.status).toBe(200);
-    expect(res.body.voiceDebug).toBeTruthy();
-    expect(res.body.voiceDebug.sampleCount).toBeGreaterThanOrEqual(5);
-
-    // POST-FIX EXPECTATION: the server reports a samplesUrl/manifest pointing to a
-    // listable storage location with all 5 entries. We probe the manifest URL if
-    // exposed; else we count files in the local uploads dir as a sanity fallback.
-    if (res.body.voiceDebug.samplesUrl) {
-      const list = await request(url()).get(res.body.voiceDebug.samplesUrl);
-      expect(list.status).toBe(200);
-      const items = list.body.items || list.body.samples || [];
-      expect(items.length).toBeGreaterThanOrEqual(5);
-    } else {
-      // Fallback: server.js still local-FS — confirm at least 5 distinct files
-      // were written to uploads/ at some point. The current bug deletes 4 of them
-      // immediately; this fallback assert WILL FAIL pre-fix and pass post-fix when
-      // sample retention is implemented.
-      const uploadsDir = path.join(__dirname, '..', 'uploads');
-      const files = fs.readdirSync(uploadsDir).filter((f) => /^voice_|sample/.test(f));
-      expect(files.length).toBeGreaterThanOrEqual(5);
-    }
+    expect(res.status).toBe(410);
+    expect(res.body.error).toBe('legacy_onboarding_disabled_use_r2_voice_bundle');
+    expect(res.body.canonicalEndpoint).toBe('/api/onboarding/voice-bundle');
   });
 });
 
@@ -565,19 +539,16 @@ describe('TG8 — Sentry breadcrumb coverage', () => {
 
     const { email } = await registerUser();
     const token = await loginUser(email);
+    const onboarding = await uploadR2VoiceBundle({ request, baseUrl: url(), token });
+    expect(onboarding.status).toBe(200);
     await request(url())
-      .post('/api/onboarding')
-      .set('Authorization', `Bearer ${token}`)
-      .field('language', 'en-US')
-      .attach('voiceSample', silentMp3Buffer(), 'sample.m4a');
-    await request(url())
-      .post('/api/affirmation/today')
+      .post('/api/generate-affirmation')
       .set('Authorization', `Bearer ${token}`)
       .send({
-        context: { blocker: 'a', vision: 'b', goal: 'c' },
+        context: r2SemanticContext(),
+        sessionId: onboarding.body.sessionId,
         language: 'en-US',
         detectedGender: 'male',
-        timezoneOffsetMinutes: 240,
       });
 
     const breadcrumbs = sentryStub.getBreadcrumbs();
@@ -605,11 +576,6 @@ describe('TG8 — Sentry breadcrumb coverage', () => {
 
     const { email } = await registerUser();
     const token = await loginUser(email);
-    await request(url())
-      .post('/api/onboarding')
-      .set('Authorization', `Bearer ${token}`)
-      .field('language', 'en-US')
-      .attach('voiceSample', silentMp3Buffer(), 'sample.m4a');
 
     const Database = require('better-sqlite3');
     const db = new Database(TEST_DB);
@@ -621,7 +587,7 @@ describe('TG8 — Sentry breadcrumb coverage', () => {
       .post('/api/affirmation/today')
       .set('Authorization', `Bearer ${token}`)
       .send({
-        context: { blocker: 'a', vision: 'b', goal: 'c' },
+        context: r2SemanticContext(),
         language: 'en-US',
         detectedGender: 'male',
         timezoneOffsetMinutes: 240,

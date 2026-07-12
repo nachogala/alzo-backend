@@ -36,6 +36,7 @@ const {
   FormData: UndiciFormData,
 } = require('undici');
 const request = require('supertest');
+const { r2SemanticContext, uploadR2VoiceBundle } = require('./helpers/r2-voice-bundle');
 
 globalThis.fetch    = undiciFetch;
 globalThis.Headers  = UndiciHeaders;
@@ -131,19 +132,9 @@ async function registerUser(
   return { email, token: res.body?.token, userId: res.body?.userId, status: res.status };
 }
 
-// Uploads the 3 onboarding clips. Returns the supertest response — callers
-// MUST forward res.body.sessionId to /api/generate-affirmation, because the
-// clone path is gated on a voice_<sessionId>.m4a file existing on disk (an
-// arbitrary sessionId would silently fall through to the else-branch fallback
-// and never exercise cloneVoiceAndSpeak).
+// Upload the canonical R2 four-capture bundle and return its sealed session.
 async function uploadVoice(token) {
-  return request(url())
-    .post('/api/onboarding')
-    .set('Authorization', `Bearer ${token}`)
-    .field('language', 'en-US')
-    .attach('q1', silentMp3Buffer(), { filename: 'q1.m4a', contentType: 'audio/mp4' })
-    .attach('q2', silentMp3Buffer(), { filename: 'q2.m4a', contentType: 'audio/mp4' })
-    .attach('voiceSample', silentMp3Buffer(), { filename: 'voice_sample.m4a', contentType: 'audio/mp4' });
+  return uploadR2VoiceBundle({ request, baseUrl: url(), token });
 }
 
 // OpenAI mock — affirmation text + transcription, persisted across the suite.
@@ -156,7 +147,7 @@ function installOpenAIMock(agent) {
       id: 'chatcmpl-vsf', object: 'chat.completion', created: Date.now(),
       model: 'gpt-4o-mini',
       choices: [{ index: 0, finish_reason: 'stop',
-        message: { role: 'assistant', content: 'You are steady and you are building. Keep going today.' } }],
+        message: { role: 'assistant', content: 'I am finishing the prototype because it supports my family. When it gets difficult, I remember why I began.' } }],
       usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
     })).persist();
 }
@@ -199,7 +190,7 @@ describe('FIX (a) — /api/generate-affirmation self-voice failure guard', () =>
     const aff = await request(url())
       .post('/api/generate-affirmation')
       .set('Authorization', `Bearer ${token}`)
-      .send({ context: 'launch ALZO', sessionId, language: 'en-US', detectedGender: 'male' });
+      .send({ context: r2SemanticContext(), sessionId, language: 'en-US', detectedGender: 'male' });
 
     // Build 23 contract: first-message success requires a verified self voice.
     // A preset fallback may exist for explicit recovery surfaces, but it must not
@@ -259,7 +250,7 @@ describe('FIX (b) — cloneVoiceAndSpeak deterministic voice-slot eviction', () 
     const aff = await request(url())
       .post('/api/generate-affirmation')
       .set('Authorization', `Bearer ${token}`)
-      .send({ context: 'launch ALZO', sessionId, language: 'en-US', detectedGender: 'male' });
+      .send({ context: r2SemanticContext(), sessionId, language: 'en-US', detectedGender: 'male' });
 
     expect(aff.status).toBe(200);
     // Eviction must have fired and targeted the OLDEST orphan (alzo_1000_*).

@@ -28,6 +28,7 @@ const voiceValidator = require("./backend/voice_validator");
 // MP3 instead of an ElevenLabs call. Saves quota; see lib/qa-mock-tts.js.
 const qaMockTts = require("./lib/qa-mock-tts");
 const alzoR2 = require("./lib/alzo-r2-contracts");
+const dailyContextBoundary = require("./lib/daily-context-boundary");
 // P0 (B53 REVENUE BLINDNESS): 6-event funnel helper. logEvent fires stdout +
 // Sentry breadcrumb + (for revenue-critical names) Sentry captureMessage.
 // See vault audits/2026-05-18-alzo-p0-analytics-observability.md.
@@ -1807,6 +1808,43 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     });
     console.error("Error generating affirmation:", err);
     res.status(500).json({ error: "Failed to generate affirmation" });
+  }
+});
+
+// R3 guided Daily Message: strict DTO boundary, no legacy context.
+app.post("/api/daily-message", express.json(), async (req, res) => {
+  try {
+    const user = getUserByToken(req);
+    if (!user) return res.status(401).json({ error: 'authentication_required_for_daily_message' });
+    const boundary = dailyContextBoundary.validateDailyContext(req.body?.context);
+    if (!boundary.ok) return res.status(422).json({ error: boundary.error, code: 'DAILY_CONTEXT_REJECTED' });
+    const nowSec = Math.floor(Date.now() / 1000);
+    const subActive = ["active", "trialing", "past_due"].includes(user.subscriptionStatus || "");
+    const inTrial = user.trialEndsAt && nowSec < user.trialEndsAt;
+    if (!subActive && !inTrial) return res.status(402).json({ error: 'subscription_required' });
+    const dateKey = new Date().toISOString().slice(0, 10);
+    const cached = stmts.getAffirmationByDate.get(user.id, dateKey);
+    if (cached) return res.json({ message: { id: cached.id || `daily_${dateKey}`, dateKey, transcript: cached.text, audioUrl: cached.audioUrl, realAudioUrl: cached.audioUrl, voiceMode: cached.voiceMode, cached: true, generationProvenance: boundary.generationProvenance } });
+    const cachedVoiceId = stmts.getVoiceId.get(user.id)?.elevenlabsVoiceId || null;
+    if (!cachedVoiceId) return res.status(409).json({ error: 'verified_self_voice_required_for_daily', code: 'SELF_VOICE_REQUIRED' });
+    const text = await generateAffirmation(boundary.context, 'en-US', 'daily');
+    const retainedMergedVoice = findLatestValidatedR2MergedVoiceForUser(user.id);
+    const cloneResult = await cloneVoiceAndSpeak(text, retainedMergedVoice, null, 'en-US', cachedVoiceId);
+    const mode = cloneResult.voiceDebug?.cloneMode;
+    if (!cloneResult.audioUrl || !['cached', 'cloned'].includes(mode)) return res.status(502).json({ error: 'daily_self_voice_tts_failed', voiceDebug: cloneResult.voiceDebug });
+    if (cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) stmts.setVoiceId.run(cloneResult.voiceId, user.id);
+    const id = crypto.randomBytes(12).toString('hex');
+    try {
+      stmts.insertAffirmation.run(id, user.id, dateKey, text, cloneResult.audioUrl, mode);
+    } catch (error) {
+      const row = stmts.getAffirmationByDate.get(user.id, dateKey);
+      if (row) return res.json({ message: { id: row.id || `daily_${dateKey}`, dateKey, transcript: row.text, audioUrl: row.audioUrl, realAudioUrl: row.audioUrl, voiceMode: row.voiceMode, cached: true, generationProvenance: boundary.generationProvenance } });
+      throw error;
+    }
+    return res.json({ message: { id, dateKey, transcript: text, audioUrl: cloneResult.audioUrl, realAudioUrl: cloneResult.audioUrl, voiceMode: mode, cached: false, generationProvenance: boundary.generationProvenance } });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { area: 'daily_message_r3', endpoint: 'daily-message' } });
+    return res.status(500).json({ error: error.code || 'daily_message_generation_failed' });
   }
 });
 

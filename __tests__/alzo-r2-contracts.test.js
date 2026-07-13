@@ -47,12 +47,13 @@ describe('ALZO R2 Final contracts', () => {
       goal: 'Finish my portfolio in ninety days.',
       purpose: 'Trust my creative direction.',
       reconnectionAnchor: 'Remember why the work is mine.',
-      checkIn: { mood: 'Tender', energy: 'Low', alignment: 'I feel distant but still connected.' },
+      checkIn: { mood: 'Tender', alignment: 'I feel distant but still connected.' },
       firstMessageReference: { messageId: 'first-1', text: 'I know why this matters.' },
       recentDailyMessages: [],
     });
     const input = JSON.parse(prompt.messages[1].content);
     expect(input.checkIn).toMatchObject({ alignmentSemantics: 'emotional_connection_only', visibleNumericScore: false, scoringEnabled: false });
+    expect(input.checkIn).not.toHaveProperty('energy');
     expect(input.firstMessageReference.use).toBe('continuity_reference_only');
   });
 

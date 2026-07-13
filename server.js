@@ -1658,22 +1658,33 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       return res.status(400).json({ error: "Context is required" });
     }
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+    const authedUser = getUserByToken(req);
+    if (!authedUser) return res.status(401).json({ error: 'authentication_required_for_r2_first_message' });
+    const expectedVoiceOwnerId = safeVoiceOwnerId(authedUser.id);
     const manifestPath = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
     let r2Manifest = null;
     try { r2Manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch {}
+    if (r2Manifest && r2Manifest.voiceOwnerId !== expectedVoiceOwnerId) {
+      return res.status(403).json({ error: 'r2_voice_owner_mismatch', sessionId });
+    }
+    const authoritativeContextResult = alzoR2.resolveAuthoritativeSemanticContext({ manifest: r2Manifest || {}, requestContext: context });
     const manifestGate = r2Manifest
       && r2Manifest.schemaVersion === 'alzo.voice_manifest.r2.v1'
+      && r2Manifest.voiceOwnerId === expectedVoiceOwnerId
       && r2Manifest.mergedVoiceArtifact?.validationPassed === true
       && Number(r2Manifest.mergedVoiceArtifact?.validAudioDurationMs) >= alzoR2.MIN_VALID_AUDIO_MS
       && Array.isArray(r2Manifest.providerFiles)
       && r2Manifest.providerFiles.length === 1
       && r2Manifest.provenanceComplete === true
       && JSON.stringify(r2Manifest.semanticCaptureOrder) === JSON.stringify(alzoR2.CAPTURE_ORDER)
-      && r2Manifest.semanticContext;
+      && authoritativeContextResult.ok;
     if (!manifestGate) {
-      return res.status(422).json({ error: 'r2_bundle_validation_required_before_first_message', sessionId });
+      const gateError = r2Manifest && !authoritativeContextResult.ok
+        ? authoritativeContextResult.error
+        : 'r2_bundle_validation_required_before_first_message';
+      return res.status(422).json({ error: gateError, sessionId });
     }
-    const authoritativeContext = r2Manifest.semanticContext;
+    const authoritativeContext = authoritativeContextResult.semanticContext;
 
     // ── QA kill switch ────────────────────────────────────────────────
     // Short-circuit BEFORE generating text + voice for QA/Maestro/internal
@@ -1705,7 +1716,6 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
 
     // R2 Final: First Message may use only the single merged artifact sealed in
     // the validated server manifest. No legacy/session/user-generic fallback.
-    const authedUser = getUserByToken(req);
     const lookupUserId = authedUser ? authedUser.id : null;
     let voicePath = r2Manifest.providerFiles[0];
     let voiceLookupMethod = 'r2Manifest';

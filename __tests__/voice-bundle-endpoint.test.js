@@ -114,16 +114,18 @@ function installElevenLabsMock(agent) {
   return state;
 }
 
-async function bootServer() {
+async function bootServer({ preserveStorage = false } = {}) {
   if (serverHarness) {
     await serverHarness.close();
     serverHarness = null;
   }
-  fs.rmSync(TEST_UPLOADS, { recursive: true, force: true });
-  fs.rmSync(TEST_AUDIO, { recursive: true, force: true });
+  if (!preserveStorage) {
+    fs.rmSync(TEST_UPLOADS, { recursive: true, force: true });
+    fs.rmSync(TEST_AUDIO, { recursive: true, force: true });
+    if (fs.existsSync(TEST_DB)) fs.unlinkSync(TEST_DB);
+  }
   fs.mkdirSync(TEST_UPLOADS, { recursive: true });
   fs.mkdirSync(TEST_AUDIO, { recursive: true });
-  if (fs.existsSync(TEST_DB)) fs.unlinkSync(TEST_DB);
 
   const backendRoot = path.resolve(__dirname, '..');
   const port = await pickFreePort();
@@ -211,11 +213,45 @@ function audioBuffer() {
 
 async function registerUser() {
   const email = `voice-bundle-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@thenetmencorp.com`;
+  const password = 'test-pass-1234';
   const res = await request(url())
     .post('/api/auth/signup')
-    .send({ email, password: 'test-pass-1234', name: 'Voice Bundle QA' })
+    .send({ email, password, name: 'Voice Bundle QA' })
     .set('Content-Type', 'application/json');
-  return { email, token: res.body?.token, userId: res.body?.userId, status: res.status };
+  return { email, password, token: res.body?.token, userId: res.body?.userId, status: res.status };
+}
+
+async function uploadContractBundle(token, suffix = 'lifecycle') {
+  const bundleId = `bundle_${suffix}_${Date.now()}`;
+  const ordered = ['goal', 'purpose', 'reconnectionAnchor', 'commitment'];
+  const voiceAttemptIds = ordered.map((stage, index) => `attempt_${suffix}_${index + 1}_${stage}`);
+  const productProvenance = {
+    build: 24,
+    source: 'alzo3-pre-account-voice-bundle',
+    requiredCaptureKeys: ordered,
+    captures: ordered.map((stage, index) => ({ captureId: `capture_${suffix}_${index + 1}_${stage}`, stage, signalClass: 'human_voice_detected' })),
+  };
+  const voiceProcessingPayload = {
+    schemaVersion: 'pre_account_voice_bundle.v1',
+    productProvenance,
+    files: ordered.map((stage, index) => ({ stage, partName: `voice_${index + 1}_${stage}`, filename: `${stage}.m4a`, mediaType: 'audio/mp4' })),
+    account: { authSessionId: `auth_${suffix}` },
+  };
+  return request(url())
+    .post('/api/onboarding/voice-bundle')
+    .set('Authorization', `Bearer ${token}`)
+    .field('schemaVersion', 'alzo.pre_account_voice_bundle.r2.v1')
+    .field('language', 'en-US')
+    .field('bundleId', bundleId)
+    .field('preAccountVoiceBundle', JSON.stringify({ bundleId, captures: {} }))
+    .field('voiceProcessingPayload', JSON.stringify(voiceProcessingPayload))
+    .field('productProvenance', JSON.stringify(productProvenance))
+    .field('semanticCaptureOrder', JSON.stringify(ordered))
+    .field('voiceAttemptIds', JSON.stringify(voiceAttemptIds))
+    .attach('voice_1_goal', audioBuffer(), { filename: 'goal.m4a', contentType: 'audio/mp4' })
+    .attach('voice_2_purpose', audioBuffer(), { filename: 'purpose.m4a', contentType: 'audio/mp4' })
+    .attach('voice_3_reconnectionAnchor', audioBuffer(), { filename: 'reconnectionAnchor.m4a', contentType: 'audio/mp4' })
+    .attach('voice_4_commitment', audioBuffer(), { filename: 'commitment.m4a', contentType: 'audio/mp4' });
 }
 
 beforeEach(async () => {
@@ -363,4 +399,57 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(firstMessage.body.voiceDebug?.sampleFiles?.[0]).toMatch(/merged\.m4a$/);
     expect(firstMessage.body.voiceDebug?.cloneMode).toBe('cloned');
   }, 30000);
+
+  it('enforces voiceOwnerId and recovers the validated merged artifact after process restart', async () => {
+    const owner = await registerUser();
+    const intruder = await registerUser();
+    expect(owner.status).toBe(200);
+    expect(intruder.status).toBe(200);
+
+    const upload = await uploadContractBundle(owner.token, 'owner_restart');
+    expect(upload.status).toBe(200);
+    const { sessionId } = upload.body;
+    const manifestPath = path.join(TEST_UPLOADS, `voice_manifest_${sessionId}.json`);
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const mergedPath = manifest.providerFiles[0];
+    expect(manifest.voiceOwnerId).toBe(owner.userId);
+    expect(manifest.providerFiles).toEqual([mergedPath]);
+    expect(manifest.sourceCaptureFiles).toHaveLength(4);
+    expect(fs.existsSync(mergedPath)).toBe(true);
+
+    const unauthorized = await request(url())
+      .post('/api/generate-affirmation')
+      .set('Authorization', `Bearer ${intruder.token}`)
+      .send({ context: upload.body.context, sessionId, language: 'en-US' });
+    expect(unauthorized.status).toBe(403);
+    expect(unauthorized.body.error).toBe('r2_voice_owner_mismatch');
+    expect(elevenState.cloneCalls).toBe(0);
+
+    await bootServer({ preserveStorage: true });
+    expect(fs.existsSync(manifestPath)).toBe(true);
+    expect(fs.existsSync(mergedPath)).toBe(true);
+
+    const recovered = await request(url())
+      .post('/api/generate-affirmation')
+      .set('Authorization', `Bearer ${owner.token}`)
+      .send({
+        context: { goal: 'request injection', commitment: 'forbidden request value' },
+        sessionId,
+        language: 'en-US',
+      });
+    expect(recovered.status).toBe(200);
+    expect(recovered.body.audioUrl).toBeTruthy();
+    expect(recovered.body.voiceDebug?.sampleFiles).toEqual([path.basename(mergedPath)]);
+    expect(fs.existsSync(mergedPath)).toBe(true);
+    expect(fs.existsSync(manifestPath)).toBe(true);
+    expect(manifest.sourceCaptureFiles.every((filePath) => fs.existsSync(filePath))).toBe(true);
+
+    fs.unlinkSync(mergedPath);
+    const missingArtifact = await request(url())
+      .post('/api/generate-affirmation')
+      .set('Authorization', `Bearer ${owner.token}`)
+      .send({ context: upload.body.context, sessionId, language: 'en-US' });
+    expect(missingArtifact.status).toBe(422);
+    expect(missingArtifact.body.error).toBe('r2_merged_artifact_missing');
+  }, 60000);
 });

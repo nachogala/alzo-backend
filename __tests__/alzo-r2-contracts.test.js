@@ -56,6 +56,49 @@ describe('ALZO R2 Final contracts', () => {
     expect(input.firstMessageReference.use).toBe('continuity_reference_only');
   });
 
+  test('authoritative Semantic Context rejects missing, extra, forbidden, unproven and hash-mismatched inputs', () => {
+    const context = {
+      goal: { text: 'Ship the meaningful work', sourceRefs: [{ captureId: 'goal-1' }] },
+      purpose: { text: 'Support my family', sourceRefs: [{ captureId: 'purpose-1' }] },
+      reconnectionAnchor: { text: 'Remember why I chose this', sourceRefs: [{ captureId: 'anchor-1' }] },
+    };
+    const hash = r2.sha256(JSON.stringify(context));
+    expect(r2.validateAuthoritativeSemanticContext(context, { expectedSha256: hash }).ok).toBe(true);
+    expect(r2.validateAuthoritativeSemanticContext({ goal: context.goal, purpose: context.purpose }).error).toBe('authoritative_semantic_context_shape_invalid');
+    expect(r2.validateAuthoritativeSemanticContext({ ...context, commitment: { text: 'forbidden' } }).error).toBe('authoritative_semantic_context_forbidden_key');
+    expect(r2.validateAuthoritativeSemanticContext({ ...context, extra: { text: 'forbidden' } }).error).toBe('authoritative_semantic_context_shape_invalid');
+    expect(r2.validateAuthoritativeSemanticContext({ ...context, goal: { text: context.goal.text, sourceRefs: [] } }).error).toBe('authoritative_semantic_context_source_ref_required');
+    expect(r2.validateAuthoritativeSemanticContext(context, { expectedSha256: '0'.repeat(64) }).error).toBe('authoritative_semantic_context_hash_mismatch');
+    const resolved = r2.resolveAuthoritativeSemanticContext({
+      manifest: { schemaVersion: 'alzo.voice_manifest.r2.v1', semanticContext: context, semanticContextSha256: hash },
+      requestContext: { goal: 'request injection', commitment: 'must be ignored' },
+    });
+    expect(resolved.ok).toBe(true);
+    expect(resolved.semanticContext).toEqual(context);
+    expect(JSON.stringify(resolved.semanticContext)).not.toMatch(/request injection|commitment/i);
+  });
+
+  test('all eight canonical Novelty dimensions are exact and each collision blocks', () => {
+    expect(r2.DAILY_NOVELTY_DIMENSIONS).toEqual([
+      'direct_phrase',
+      'central_idea',
+      'rhetorical_structure',
+      'opening',
+      'closing',
+      'metaphor_image',
+      'goal_interpretation_angle',
+      'reconnection_anchor_use_framing_placement',
+    ]);
+    const allDistinct = Object.fromEntries(r2.DAILY_NOVELTY_CHECK_KEYS.map((key) => [key, true]));
+    expect(r2.validateDailyNoveltyChecks(allDistinct).ok).toBe(true);
+    for (const key of r2.DAILY_NOVELTY_CHECK_KEYS) {
+      const result = r2.validateDailyNoveltyChecks({ ...allDistinct, [key]: false });
+      expect(result.ok).toBe(false);
+      expect(result.collisions).toEqual([key]);
+    }
+    expect(r2.validateDailyNoveltyChecks({ ...allDistinct, ninthDimension: true }).unexpected).toEqual(['ninthDimension']);
+  });
+
   const valid = {
     mergedDurationMs: 64270,
     validAudioDurationMs: 64270,

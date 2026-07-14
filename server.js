@@ -29,6 +29,8 @@ const voiceValidator = require("./backend/voice_validator");
 const qaMockTts = require("./lib/qa-mock-tts");
 const alzoR2 = require("./lib/alzo-r2-contracts");
 const dailyContextBoundary = require("./lib/daily-context-boundary");
+const { buildAuthoritativeAuthResponse, normalizeAuthoritativeProfile } = require("./lib/auth-contract");
+const { WIRE_CONTRACT_VERSION, VOICE_MULTIPART_FIELDS, VOICE_DURATION_RULE } = require("./lib/release-contract");
 // P0 (B53 REVENUE BLINDNESS): 6-event funnel helper. logEvent fires stdout +
 // Sentry breadcrumb + (for revenue-critical names) Sentry captureMessage.
 // See vault audits/2026-05-18-alzo-p0-analytics-observability.md.
@@ -1046,13 +1048,10 @@ const onboardingUpload = upload.fields([
 ]);
 
 const preAccountVoiceBundleUpload = upload.fields([
-  { name: "voice_1_goal", maxCount: 1 },
-  { name: "voice_2_purpose", maxCount: 1 },
-  { name: "voice_3_reconnectionAnchor", maxCount: 1 },
-  { name: "voice_4_commitment", maxCount: 1 },
-  // Request compatibility only; R2 responses and new mobile payloads use canonical names.
-  { name: "voice_3_resistance", maxCount: 1 },
-  { name: "voice_4_commitmentReading", maxCount: 1 },
+  { name: VOICE_MULTIPART_FIELDS.goal, maxCount: 1 },
+  { name: VOICE_MULTIPART_FIELDS.purpose, maxCount: 1 },
+  { name: VOICE_MULTIPART_FIELDS.reconnectionAnchor, maxCount: 1 },
+  { name: VOICE_MULTIPART_FIELDS.commitment, maxCount: 1 },
 ]);
 
 function parseJsonBodyField(value, fallback = {}) {
@@ -1323,13 +1322,13 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
     }
 
     const captureSpecs = [
-      { stage: 'goal', part: 'voice_1_goal', legacyPart: null },
-      { stage: 'purpose', part: 'voice_2_purpose', legacyPart: null },
-      { stage: 'reconnectionAnchor', part: 'voice_3_reconnectionAnchor', legacyPart: 'voice_3_resistance' },
-      { stage: 'commitment', part: 'voice_4_commitment', legacyPart: 'voice_4_commitmentReading' },
+      { stage: 'goal', part: VOICE_MULTIPART_FIELDS.goal },
+      { stage: 'purpose', part: VOICE_MULTIPART_FIELDS.purpose },
+      { stage: 'reconnectionAnchor', part: VOICE_MULTIPART_FIELDS.reconnectionAnchor },
+      { stage: 'commitment', part: VOICE_MULTIPART_FIELDS.commitment },
     ];
 
-    const uploadedFor = (spec) => req.files?.[spec.part]?.[0] || (spec.legacyPart ? req.files?.[spec.legacyPart]?.[0] : null);
+    const uploadedFor = (spec) => req.files?.[spec.part]?.[0];
     const missing = captureSpecs.filter((spec) => !uploadedFor(spec)).map((spec) => spec.part);
     if (missing.length > 0) {
       return res.status(400).json({
@@ -2246,7 +2245,11 @@ app.post("/api/auth/signup", (req, res) => {
   // P0 REVENUE BLINDNESS — funnel event #1
   logAnalyticsEvent("signup", { provider: "email", trial_ends_at: trialEndsAt }, userId);
 
-  res.json({ token, userId, trialEndsAt });
+  const storedUser = stmts.getByEmail.get(email.toLowerCase());
+  res.json({
+    ...buildAuthoritativeAuthResponse({ token, user: storedUser, isNewUser: true, provider: 'email' }),
+    trialEndsAt,
+  });
 });
 
 app.post("/api/auth/reset-password", (req, res) => {
@@ -2272,8 +2275,9 @@ app.post("/api/auth/login", (req, res) => {
 
   const token = generateToken();
   stmts.updateToken.run(token, email.toLowerCase());
+  const storedUser = stmts.getByEmail.get(email.toLowerCase());
 
-  res.json({ token, userId: user.id });
+  res.json(buildAuthoritativeAuthResponse({ token, user: storedUser, isNewUser: false, provider: 'email' }));
 });
 
 // Apple Sign-in: identityToken from frontend, verify signature against Apple JWKS
@@ -2302,7 +2306,13 @@ app.post("/api/auth/apple", async (req, res) => {
 
   if (user) {
     stmts.updateToken.run(token, email);
-    return res.json({ token, userId: user.id, isNewUser: false });
+    const storedUser = stmts.getByEmail.get(email);
+    return res.json(buildAuthoritativeAuthResponse({
+      token,
+      user: storedUser,
+      isNewUser: false,
+      provider: 'apple',
+    }));
   }
 
   const userId = crypto.randomBytes(16).toString("hex");
@@ -2310,7 +2320,13 @@ app.post("/api/auth/apple", async (req, res) => {
   stmts.insert.run(userId, email, name, "apple_sso_" + appleSub, token);
   // P0 REVENUE BLINDNESS — funnel event #1 (Apple SSO new user)
   logAnalyticsEvent("signup", { provider: "apple" }, userId);
-  res.json({ token, userId, isNewUser: true });
+  const storedUser = stmts.getByEmail.get(email);
+  res.json(buildAuthoritativeAuthResponse({
+    token,
+    user: storedUser,
+    isNewUser: true,
+    provider: 'apple',
+  }));
 });
 
 // Google Sign-in: idToken from frontend, verify signature against Google JWKS
@@ -2344,7 +2360,13 @@ app.post("/api/auth/google", async (req, res) => {
 
   if (user) {
     stmts.updateToken.run(token, email);
-    return res.json({ token, userId: user.id, isNewUser: false });
+    const storedUser = stmts.getByEmail.get(email);
+    return res.json(buildAuthoritativeAuthResponse({
+      token,
+      user: storedUser,
+      isNewUser: false,
+      provider: 'google',
+    }));
   }
 
   const userId = crypto.randomBytes(16).toString("hex");
@@ -2352,7 +2374,13 @@ app.post("/api/auth/google", async (req, res) => {
   stmts.insert.run(userId, email, name, "google_sso_" + googleSub, token);
   // P0 REVENUE BLINDNESS — funnel event #1 (Google SSO new user)
   logAnalyticsEvent("signup", { provider: "google" }, userId);
-  res.json({ token, userId, isNewUser: true });
+  const storedUser = stmts.getByEmail.get(email);
+  res.json(buildAuthoritativeAuthResponse({
+    token,
+    user: storedUser,
+    isNewUser: true,
+    provider: 'google',
+  }));
 });
 
 app.get("/api/user/profile", (req, res) => {
@@ -2360,7 +2388,11 @@ app.get("/api/user/profile", (req, res) => {
   if (!user) return res.status(401).json({ error: "Unauthorized" });
   // Decay plants on profile load (handles users who missed days)
   decayPlantHealth(user.id);
-  res.json({ email: user.email, name: user.name, streak: user.streak, language: user.language, plan: user.plan });
+  res.json({
+    userId: user.id,
+    accountCreated: true,
+    profile: normalizeAuthoritativeProfile(user),
+  });
 });
 
 // B48-21: account deletion with cascade. Steps:
@@ -2579,12 +2611,53 @@ app.get("/audio/demo.mp3", (req, res) => {
   }
 });
 
+// ── Release authority and non-PII canary trace ───────────────────────
+const releaseSha = () => process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_SHA || process.env.COMMIT_SHA || "unknown";
+const canaryTraces = new Map();
+
+app.get("/api/release-contract", (req, res) => {
+  res.json({
+    ok: true,
+    backendLiveSha: releaseSha(),
+    wireContractVersion: WIRE_CONTRACT_VERSION,
+    voiceMultipartFields: VOICE_MULTIPART_FIELDS,
+    voiceDurationRule: VOICE_DURATION_RULE,
+  });
+});
+
+app.post("/api/observability/canary", (req, res) => {
+  const correlationId = String(req.get('x-correlation-id') || req.body?.correlationId || crypto.randomUUID()).slice(0, 160);
+  const receipt = {
+    schema: 'alzo.backend_canary_trace.v1',
+    correlationId,
+    status: 'completed',
+    backendLiveSha: releaseSha(),
+    wireContractVersion: WIRE_CONTRACT_VERSION,
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+  };
+  canaryTraces.set(correlationId, receipt);
+  if (canaryTraces.size > 100) canaryTraces.delete(canaryTraces.keys().next().value);
+  console.log(JSON.stringify({ event: 'observability.canary.completed', ...receipt }));
+  res.set('x-correlation-id', correlationId).json(receipt);
+});
+
+app.get("/api/observability/canary/:correlationId", (req, res) => {
+  const correlationId = String(req.params.correlationId || '').slice(0, 160);
+  const receipt = canaryTraces.get(correlationId);
+  if (!receipt) return res.status(404).json({ error: 'canary_trace_not_found', correlationId });
+  return res.json(receipt);
+});
+
 // ── Health check ─────────────────────────────────────────────────────
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     app: "ALZO",
-    version: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_SHA || "unknown",
+    version: releaseSha(),
+    backendLiveSha: releaseSha(),
+    wireContractVersion: WIRE_CONTRACT_VERSION,
+    voiceDurationRuleVersion: VOICE_DURATION_RULE.version,
     openai: !!process.env.OPENAI_API_KEY,
     elevenlabs: !!ELEVENLABS_API_KEY,
     audioStorage: {

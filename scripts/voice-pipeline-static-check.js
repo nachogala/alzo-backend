@@ -13,8 +13,11 @@ const checks = [
   [files.server, 'mergedVoiceArtifact: mergeResult.artifact', 'voice bundle returns merged artifact metadata'],
   [files.server, 'createMergedVoiceArtifact', 'voice bundle creates merged voice artifact before provider'],
   [files.server, 'voice_user_${voiceOwnerId}_${sessionId}.m4a', 'onboarding writes user-scoped retained sample'],
-  [files.server, 'f.startsWith(`voice_user_${safeUserId}_`)', 'daily fallback prefers authenticated user sample'],
-  [files.server, 'voiceCandidate = userVoiceCandidates[0] || legacyVoiceCandidates[0]', 'daily fallback keeps legacy compatibility only after user sample'],
+  [files.server, 'function findLatestValidatedR2MergedVoiceForUser(userId)', 'daily voice lookup uses the validated R2 manifest selector'],
+  [files.server, 'raw.voiceOwnerId !== userId', 'daily voice lookup enforces authenticated user ownership'],
+  [files.server, 'raw.mergedVoiceArtifact?.validationPassed !== true', 'daily voice lookup requires validated merged audio'],
+  [files.server, 'Array.isArray(raw.providerFiles) || raw.providerFiles.length !== 1', 'daily voice lookup requires exactly one merged provider file'],
+  [files.server, 'findLatestValidatedR2MergedVoiceForUser(user.id)', 'daily generation consumes the user-scoped validated merged voice'],
   [files.server, 'app.get("/api/health/voice", async (req, res) => {', 'voice health endpoint exists'],
 
   [files.server, 'app.post(\"/api/onboarding/voice-bundle\", preAccountVoiceBundleUpload', 'voice bundle endpoint exists'],

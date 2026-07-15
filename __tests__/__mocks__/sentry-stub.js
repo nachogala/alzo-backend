@@ -12,12 +12,12 @@
 // (otherwise every server.js boot under test gets a NEW stub instance and the
 // test side and the server side are pushing/reading from different objects).
 if (!globalThis.__SENTRY_STUB_STATE__) {
-  globalThis.__SENTRY_STUB_STATE__ = { breadcrumbs: [], messages: [], exceptions: [] };
+  globalThis.__SENTRY_STUB_STATE__ = { breadcrumbs: [], messages: [], exceptions: [], initOptions: null };
 }
 const _state = globalThis.__SENTRY_STUB_STATE__;
 
 module.exports = {
-  init: () => {},
+  init: (options) => { _state.initOptions = options || {}; },
   addBreadcrumb: (b) => { _state.breadcrumbs.push(b || {}); },
   captureMessage: (msg, opts) => { _state.messages.push({ msg, opts }); },
   captureException: (err, opts) => { _state.exceptions.push({ err, opts }); },
@@ -37,6 +37,11 @@ module.exports = {
   getBreadcrumbs: () => [..._state.breadcrumbs],
   getMessages: () => [..._state.messages],
   getExceptions: () => [..._state.exceptions],
+  applyBeforeSend: (event) => (
+    typeof _state.initOptions?.beforeSend === 'function'
+      ? _state.initOptions.beforeSend(event)
+      : event
+  ),
   _reset: () => {
     _state.breadcrumbs.length = 0;
     _state.messages.length = 0;

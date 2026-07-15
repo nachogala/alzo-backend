@@ -1,11 +1,40 @@
 require("dotenv").config();
 const Sentry = require("@sentry/node");
+
+const SENTRY_PRIVATE_HEADER_NAMES = new Set([
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'proxy-authorization',
+]);
+
+function sanitizeSentryEvent(event) {
+  if (!event || typeof event !== 'object') return event;
+  const request = event.request;
+  if (!request || typeof request !== 'object') return event;
+
+  // Backend events never need request bodies or cookies. Remove them before
+  // they leave the process instead of relying on provider-side scrubbing.
+  delete request.data;
+  delete request.cookies;
+
+  if (Array.isArray(request.headers)) {
+    request.headers = request.headers.filter(([name]) => !SENTRY_PRIVATE_HEADER_NAMES.has(String(name).toLowerCase()));
+  } else if (request.headers && typeof request.headers === 'object') {
+    for (const name of Object.keys(request.headers)) {
+      if (SENTRY_PRIVATE_HEADER_NAMES.has(name.toLowerCase())) delete request.headers[name];
+    }
+  }
+  return event;
+}
+
 Sentry.init({
   dsn: process.env.SENTRY_DSN || "",
   enabled: !!process.env.SENTRY_DSN,
   environment: process.env.NODE_ENV || "production",
   serverName: "alzo-backend",
   tracesSampleRate: 0.1,
+  beforeSend: sanitizeSentryEvent,
 });
 const express = require("express");
 const multer = require("multer");

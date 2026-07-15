@@ -182,4 +182,37 @@ describe('Apple native identity-token audience contract', () => {
     expect(serializedEvent).not.toContain('identityToken');
     expect(serializedEvent).not.toContain('body');
   });
+
+  test('beforeSend removes auth request bodies, identityToken keys, cookies, and authorization headers from captured Apple failures', () => {
+    const sanitized = sentryStub.applyBeforeSend({
+      message: 'auth.apple.verify.failed',
+      transaction: 'POST /api/auth/apple',
+      request: {
+        url: 'https://alzo-backend-production.up.railway.app/api/auth/apple',
+        method: 'POST',
+        data: {
+          identityToken: 'raw-identity-token-must-never-leave-process',
+          email: 'private@example.test',
+        },
+        cookies: { session: 'private-cookie' },
+        headers: {
+          Authorization: 'Bearer private-auth-token',
+          Cookie: 'session=private-cookie',
+          'x-request-id': 'req_safe_observability',
+        },
+      },
+    });
+
+    expect(sanitized.request).not.toHaveProperty('data');
+    expect(sanitized.request).not.toHaveProperty('cookies');
+    expect(sanitized.request.headers).not.toHaveProperty('Authorization');
+    expect(sanitized.request.headers).not.toHaveProperty('Cookie');
+    expect(sanitized.request.headers['x-request-id']).toBe('req_safe_observability');
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).not.toContain('identityToken');
+    expect(serialized).not.toContain('raw-identity-token-must-never-leave-process');
+    expect(serialized).not.toContain('private@example.test');
+    expect(serialized).not.toContain('private-cookie');
+    expect(serialized).not.toContain('private-auth-token');
+  });
 });

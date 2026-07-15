@@ -525,7 +525,11 @@ async function generateAffirmation(context, language, messageKind = 'first') {
   });
   const retryMessages = prompt.messages.concat([{
     role: 'user',
-    content: `Repair only these validation failures: ${first.policy.failureCodes.join(',') || first.transport.validation_result}. Stay strictly inside the original Goal, Purpose and Reconnection Anchor. Return plain message text only.`,
+    content: alzoR2.buildMessageRepairInstruction({
+      failureCodes: first.policy.failureCodes,
+      matchedForbiddenWords: first.policy.matchedForbiddenWords,
+      transportValidation: first.transport.validation_result,
+    }),
   }]);
   const second = await attempt(retryMessages, true, 0.15);
   if (second.ok) return second.policy.text;

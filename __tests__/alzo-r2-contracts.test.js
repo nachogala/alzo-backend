@@ -172,6 +172,41 @@ describe('ALZO R2 Final contracts', () => {
     if (expectedCode) expect(result.failureCodes).toContain(expectedCode);
   });
 
+  test('prompt and validator derive the coaching ban from one exported constant', () => {
+    const exactInstruction = `Never use these words: ${r2.FORBIDDEN_COACHING_TERMS.join(', ')}.`;
+    const first = r2.buildFirstPrompt({ goal: 'Finish my portfolio.', purpose: 'Trust my direction.', reconnectionAnchor: 'Remember why this is mine.' });
+    const daily = r2.buildDailyPrompt({ goal: 'Finish my portfolio.', purpose: 'Trust my direction.', reconnectionAnchor: 'Remember why this is mine.' });
+
+    expect(first.promptVersion).toBe('alzo.first.r2.v2');
+    expect(daily.promptVersion).toBe('alzo.daily.r3.v2');
+    expect(first.messages[0].content).toContain(exactInstruction);
+    expect(daily.messages[0].content).toContain(exactInstruction);
+
+    for (const term of r2.FORBIDDEN_COACHING_TERMS) {
+      const result = r2.validateMessageText(`I ${term} while remembering why this matters.`);
+      expect(result.failureCodes).toContain('plan_action_or_coaching_present');
+      expect(result.matchedForbiddenWords).toContain(term);
+    }
+  });
+
+  test('a plan rejection gives the repair retry the exact matched word and canonical full list', () => {
+    const generatedText = 'I have a clear plan because this promise matters to my family.';
+    const validation = r2.validateMessageText(generatedText);
+    expect(validation).toMatchObject({
+      ok: false,
+      failureCodes: expect.arrayContaining(['plan_action_or_coaching_present']),
+      matchedForbiddenWords: ['plan'],
+    });
+
+    const repair = r2.buildMessageRepairInstruction({
+      failureCodes: validation.failureCodes,
+      matchedForbiddenWords: validation.matchedForbiddenWords,
+      transportValidation: 'pass',
+    });
+    expect(repair).toContain('The previous output used these forbidden words: plan.');
+    expect(repair).toContain(`Never use these words: ${r2.FORBIDDEN_COACHING_TERMS.join(', ')}.`);
+  });
+
   test('First text validator blocks second person, product and coaching', () => {
     expect(r2.validateMessageText('I remember why this goal matters to me.').ok).toBe(true);
     expect(r2.validateMessageText('You should use ALZO and take action.').failureCodes).toEqual(expect.arrayContaining([

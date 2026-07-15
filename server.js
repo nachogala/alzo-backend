@@ -1359,10 +1359,14 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
     let semanticExtraction;
     let detectedGender;
     try {
-      for (const spec of captureSpecs) {
+      const transcriptionResults = await Promise.all(captureSpecs.map(async (spec) => {
         const uploaded = uploadedFor(spec);
-        const filePath = uploaded.path;
-        const transcription = await transcribeAudio(filePath, language, { signal: semanticResolutionController.signal });
+        const transcription = await transcribeAudio(uploaded.path, language, { signal: semanticResolutionController.signal });
+        return { spec, uploaded, transcription };
+      }));
+
+      for (const [index, result] of transcriptionResults.entries()) {
+        const { spec, uploaded, transcription } = result;
         if (transcription && transcription.trim().length > 5) {
           transcriptByStage[spec.stage] = transcription;
           transcriptions.push(transcription);
@@ -1374,7 +1378,7 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
           captureId: provenance.captureId || null,
           signalClass: provenance.signalClass || 'human_voice_detected',
           voiceAttemptId: Array.isArray(voiceAttemptIds)
-            ? voiceAttemptIds[captureReceipt.length] || null
+            ? voiceAttemptIds[index] || null
             : (voiceAttemptIds && voiceAttemptIds[spec.stage]) || null,
           originalName: uploaded.originalname || null,
           mimeType: uploaded.mimetype || null,

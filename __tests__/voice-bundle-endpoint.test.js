@@ -67,13 +67,22 @@ function mockAgentSetup() {
   return agent;
 }
 
-function installOpenAIMock(agent, { transcriptionDelayMs = 0 } = {}) {
+function installOpenAIMock(agent, { transcriptionDelayMs = 0, transcriptionPlan = null } = {}) {
   const pool = agent.get('https://api.openai.com');
-  let transcriptionScope = pool
-    .intercept({ path: '/v1/audio/transcriptions', method: 'POST' })
-    .reply(200, { text: 'I choose the work, remember the purpose, face resistance, and commit out loud.' });
-  if (transcriptionDelayMs > 0) transcriptionScope = transcriptionScope.delay(transcriptionDelayMs);
-  transcriptionScope.persist();
+  if (Array.isArray(transcriptionPlan)) {
+    for (const item of transcriptionPlan) {
+      let scope = pool
+        .intercept({ path: '/v1/audio/transcriptions', method: 'POST' })
+        .reply(200, { text: item.text });
+      if (item.delayMs > 0) scope = scope.delay(item.delayMs);
+    }
+  } else {
+    let transcriptionScope = pool
+      .intercept({ path: '/v1/audio/transcriptions', method: 'POST' })
+      .reply(200, { text: 'I choose the work, remember the purpose, face resistance, and commit out loud.' });
+    if (transcriptionDelayMs > 0) transcriptionScope = transcriptionScope.delay(transcriptionDelayMs);
+    transcriptionScope.persist();
+  }
   pool
     .intercept({ path: '/v1/chat/completions', method: 'POST' })
     .reply(200, {
@@ -298,6 +307,48 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(res.body.correlationId).toBeTruthy();
     expect(elevenState.cloneCalls).toBe(0);
     expect(fs.readdirSync(TEST_UPLOADS)).toHaveLength(0);
+  }, 30000);
+
+  it('parallelizes four slow transcriptions within one shared budget and preserves deterministic receipt provenance order', async () => {
+    await mockAgent.close();
+    mockAgent = mockAgentSetup();
+    installOpenAIMock(mockAgent, {
+      transcriptionPlan: [
+        { delayMs: 110, text: 'My concrete goal is to finish meaningful work with calm focus every morning.' },
+        { delayMs: 20, text: 'My purpose is to keep my promises and be present for the people I love.' },
+        { delayMs: 80, text: 'When resistance appears I return with one breath and one honest next step.' },
+        { delayMs: 50, text: 'Today I commit to show up with patience and complete one meaningful action.' },
+      ],
+    });
+    elevenState = installElevenLabsMock(mockAgent);
+    await bootServer({ semanticResolutionTimeoutMs: 180 });
+
+    const { token, status } = await registerUser();
+    expect(status).toBe(200);
+    const res = await uploadContractBundle(token, 'parallel_budget_order');
+
+    if (res.status !== 200) console.log('parallel transcription failure response', res.status, res.body);
+    expect(res.status).toBe(200);
+    expect(res.body.captureReceipt.map((item) => item.stage)).toEqual([
+      'goal',
+      'purpose',
+      'reconnectionAnchor',
+      'commitment',
+    ]);
+    expect(res.body.captureReceipt.map((item) => item.partName)).toEqual([
+      'voice_1_goal',
+      'voice_2_purpose',
+      'voice_3_reconnectionAnchor',
+      'voice_4_commitment',
+    ]);
+    expect(res.body.captureReceipt.map((item) => item.voiceAttemptId)).toEqual([
+      'attempt_parallel_budget_order_1_goal',
+      'attempt_parallel_budget_order_2_purpose',
+      'attempt_parallel_budget_order_3_reconnectionAnchor',
+      'attempt_parallel_budget_order_4_commitment',
+    ]);
+    expect(res.body.captureReceipt.every((item) => item.transcribed === true)).toBe(true);
+    expect(elevenState.cloneCalls).toBe(0);
   }, 30000);
 
   it('accepts the Build 21 four-capture contract and preserves provenance/session correlation', async () => {

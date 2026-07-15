@@ -58,10 +58,17 @@ describe('ALZO R2 Final contracts', () => {
   });
 
   test('authoritative Semantic Context rejects missing, extra, forbidden, unproven and hash-mismatched inputs', () => {
+    const sourceRefs = (captureId, quotedText) => [{
+      captureId,
+      transcriptSha256: r2.sha256(quotedText),
+      quotedText,
+      start: 0,
+      end: quotedText.length,
+    }];
     const context = {
-      goal: { text: 'Ship the meaningful work', sourceRefs: [{ captureId: 'goal-1' }] },
-      purpose: { text: 'Support my family', sourceRefs: [{ captureId: 'purpose-1' }] },
-      reconnectionAnchor: { text: 'Remember why I chose this', sourceRefs: [{ captureId: 'anchor-1' }] },
+      goal: { text: 'Ship the meaningful work', sourceRefs: sourceRefs('goal-1', 'Ship the meaningful work') },
+      purpose: { text: 'Support my family', sourceRefs: sourceRefs('purpose-1', 'Support my family') },
+      reconnectionAnchor: { text: 'Remember why I chose this', sourceRefs: sourceRefs('anchor-1', 'Remember why I chose this') },
     };
     const hash = r2.sha256(JSON.stringify(context));
     expect(r2.validateAuthoritativeSemanticContext(context, { expectedSha256: hash }).ok).toBe(true);
@@ -69,6 +76,10 @@ describe('ALZO R2 Final contracts', () => {
     expect(r2.validateAuthoritativeSemanticContext({ ...context, commitment: { text: 'forbidden' } }).error).toBe('authoritative_semantic_context_forbidden_key');
     expect(r2.validateAuthoritativeSemanticContext({ ...context, extra: { text: 'forbidden' } }).error).toBe('authoritative_semantic_context_shape_invalid');
     expect(r2.validateAuthoritativeSemanticContext({ ...context, goal: { text: context.goal.text, sourceRefs: [] } }).error).toBe('authoritative_semantic_context_source_ref_required');
+    expect(r2.validateAuthoritativeSemanticContext({
+      ...context,
+      goal: { text: context.goal.text, sourceRefs: sourceRefs('goal-1', 'different text') },
+    })).toMatchObject({ ok: false, error: 'authoritative_semantic_context_source_ref_integrity_invalid', key: 'goal' });
     expect(r2.validateAuthoritativeSemanticContext(context, { expectedSha256: '0'.repeat(64) }).error).toBe('authoritative_semantic_context_hash_mismatch');
     const resolved = r2.resolveAuthoritativeSemanticContext({
       manifest: { schemaVersion: 'alzo.voice_manifest.r2.v1', semanticContext: context, semanticContextSha256: hash },
@@ -77,6 +88,41 @@ describe('ALZO R2 Final contracts', () => {
     expect(resolved.ok).toBe(true);
     expect(resolved.semanticContext).toEqual(context);
     expect(JSON.stringify(resolved.semanticContext)).not.toMatch(/request injection|commitment/i);
+  });
+
+  test('authoritative Semantic Context rejects internal pending markers and legacy fixture prose before First Message', () => {
+    const sourceRefs = (captureId, quotedText) => [{
+      captureId,
+      transcriptSha256: r2.sha256(quotedText),
+      quotedText,
+      start: 0,
+      end: quotedText.length,
+    }];
+    const purpose = 'I want to trust that I can keep a promise to myself.';
+    const anchor = 'When motivation drops, I want to remember that returning still counts.';
+    const pending = 'backend_transcription_pending';
+    const pendingContext = {
+      goal: { text: pending, sourceRefs: sourceRefs('goal-pending', pending) },
+      purpose: { text: purpose, sourceRefs: sourceRefs('purpose-real', purpose) },
+      reconnectionAnchor: { text: anchor, sourceRefs: sourceRefs('anchor-real', anchor) },
+    };
+    expect(r2.validateAuthoritativeSemanticContext(pendingContext)).toMatchObject({
+      ok: false,
+      error: 'authoritative_semantic_context_placeholder_forbidden',
+      key: 'goal',
+    });
+
+    const fixture = 'The reason I recorded for this goal.';
+    const fixtureContext = {
+      ...pendingContext,
+      goal: { text: 'I will rebuild a steady training rhythm over the next ninety days.', sourceRefs: sourceRefs('goal-real', 'I will rebuild a steady training rhythm over the next ninety days.') },
+      purpose: { text: fixture, sourceRefs: sourceRefs('purpose-fixture', fixture) },
+    };
+    expect(r2.validateAuthoritativeSemanticContext(fixtureContext)).toMatchObject({
+      ok: false,
+      error: 'authoritative_semantic_context_placeholder_forbidden',
+      key: 'purpose',
+    });
   });
 
   test('all eight canonical Novelty dimensions are exact and each collision blocks', () => {

@@ -38,6 +38,10 @@ const { logEvent: logAnalyticsEvent } = require("./lib/analytics-events");
 
 const app = express();
 const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
+const configuredSemanticResolutionTimeoutMs = Number(process.env.SEMANTIC_RESOLUTION_TIMEOUT_MS || 120000);
+const SEMANTIC_RESOLUTION_TIMEOUT_MS = Number.isFinite(configuredSemanticResolutionTimeoutMs) && configuredSemanticResolutionTimeoutMs > 0
+  ? configuredSemanticResolutionTimeoutMs
+  : 120000;
 
 // ── SQLite persistence ──────────────────────────────────────────────
 const db = new Database(process.env.DB_PATH || "./alzo.db");
@@ -1236,7 +1240,7 @@ function findLatestValidatedR2MergedVoiceForUser(userId) {
 // ── Transcribe audio with Whisper ────────────────────────────────────
 // language: app language code (e.g. 'en-US', 'es-AR') — used to hint Whisper
 // so it doesn't auto-detect the wrong language from accent/context
-async function transcribeAudio(filePath, language) {
+async function transcribeAudio(filePath, language, { signal } = {}) {
   try {
     const fileBuffer = fs.readFileSync(filePath);
     const blob = new Blob([fileBuffer], { type: 'audio/m4a' });
@@ -1251,18 +1255,20 @@ async function transcribeAudio(filePath, language) {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
       body: formData,
+      signal,
     });
     if (!res.ok) return null;
     const data = await res.json();
     return data.text || null;
   } catch (e) {
+    if (signal?.aborted || e?.name === 'AbortError') throw e;
     console.error('Transcription error:', e.message);
     return null;
   }
 }
 
 // ── Detect gender from transcription text via GPT ────────────────────
-async function detectGender(transcriptions) {
+async function detectGender(transcriptions, { signal } = {}) {
   if (!transcriptions || transcriptions.length === 0) return null;
   try {
     const combined = transcriptions.filter(Boolean).join(' ');
@@ -1270,6 +1276,7 @@ async function detectGender(transcriptions) {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      signal,
       body: JSON.stringify({
         model: _MINI_MODEL,
         messages: [
@@ -1286,6 +1293,7 @@ async function detectGender(transcriptions) {
     if (answer === 'male' || answer === 'female') return answer;
     return null;
   } catch (e) {
+    if (signal?.aborted || e?.name === 'AbortError') throw e;
     return null;
   }
 }
@@ -1341,48 +1349,75 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
     }
 
     const transcriptByStage = {};
-    const audioFiles = [];
+    const audioFiles = captureSpecs.map((spec) => uploadedFor(spec).path);
     const transcriptions = [];
     const captureReceipt = [];
     const provenanceCaptures = Array.isArray(productProvenance?.captures) ? productProvenance.captures : [];
-
-    for (const spec of captureSpecs) {
-      const uploaded = uploadedFor(spec);
-      const filePath = uploaded.path;
-      audioFiles.push(filePath);
-      const transcription = await transcribeAudio(filePath, language);
-      if (transcription && transcription.trim().length > 5) {
-        transcriptByStage[spec.stage] = transcription;
-        transcriptions.push(transcription);
+    const semanticResolutionController = new AbortController();
+    const semanticResolutionTimer = setTimeout(() => semanticResolutionController.abort(), SEMANTIC_RESOLUTION_TIMEOUT_MS);
+    semanticResolutionTimer.unref?.();
+    let semanticExtraction;
+    let detectedGender;
+    try {
+      for (const spec of captureSpecs) {
+        const uploaded = uploadedFor(spec);
+        const filePath = uploaded.path;
+        const transcription = await transcribeAudio(filePath, language, { signal: semanticResolutionController.signal });
+        if (transcription && transcription.trim().length > 5) {
+          transcriptByStage[spec.stage] = transcription;
+          transcriptions.push(transcription);
+        }
+        const provenance = provenanceCaptures.find((item) => item.stage === spec.stage || (spec.stage === 'reconnectionAnchor' && item.stage === 'resistance') || (spec.stage === 'commitment' && item.stage === 'commitmentReading')) || {};
+        captureReceipt.push({
+          stage: spec.stage,
+          partName: spec.part,
+          captureId: provenance.captureId || null,
+          signalClass: provenance.signalClass || 'human_voice_detected',
+          voiceAttemptId: Array.isArray(voiceAttemptIds)
+            ? voiceAttemptIds[captureReceipt.length] || null
+            : (voiceAttemptIds && voiceAttemptIds[spec.stage]) || null,
+          originalName: uploaded.originalname || null,
+          mimeType: uploaded.mimetype || null,
+          size: uploaded.size || null,
+          transcribed: Boolean(transcription && transcription.trim().length > 5),
+        });
       }
-      const provenance = provenanceCaptures.find((item) => item.stage === spec.stage || (spec.stage === 'reconnectionAnchor' && item.stage === 'resistance') || (spec.stage === 'commitment' && item.stage === 'commitmentReading')) || {};
-      captureReceipt.push({
-        stage: spec.stage,
-        partName: spec.part,
-        captureId: provenance.captureId || null,
-        signalClass: provenance.signalClass || 'human_voice_detected',
-        voiceAttemptId: Array.isArray(voiceAttemptIds)
-          ? voiceAttemptIds[captureReceipt.length] || null
-          : (voiceAttemptIds && voiceAttemptIds[spec.stage]) || null,
-        originalName: uploaded.originalname || null,
-        mimeType: uploaded.mimetype || null,
-        size: uploaded.size || null,
-        transcribed: Boolean(transcription && transcription.trim().length > 5),
-      });
-    }
 
-    const semanticExtraction = alzoR2.buildSemanticExtraction({
-      goal: { ...provenanceCaptures.find((item) => item.stage === 'goal'), transcript: transcriptByStage.goal, goalConcrete: true },
-      purpose: { ...provenanceCaptures.find((item) => item.stage === 'purpose'), transcript: transcriptByStage.purpose },
-      reconnectionAnchor: { ...provenanceCaptures.find((item) => item.stage === 'reconnectionAnchor' || item.stage === 'resistance'), transcript: transcriptByStage.reconnectionAnchor },
-    });
-    if (semanticExtraction.status !== 'ready') {
+      semanticExtraction = alzoR2.buildSemanticExtraction({
+        goal: { ...provenanceCaptures.find((item) => item.stage === 'goal'), transcript: transcriptByStage.goal, goalConcrete: true },
+        purpose: { ...provenanceCaptures.find((item) => item.stage === 'purpose'), transcript: transcriptByStage.purpose },
+        reconnectionAnchor: { ...provenanceCaptures.find((item) => item.stage === 'reconnectionAnchor' || item.stage === 'resistance'), transcript: transcriptByStage.reconnectionAnchor },
+      });
+      if (semanticExtraction.status !== 'ready') {
+        audioFiles.forEach((file) => { try { fs.unlinkSync(file); } catch {} });
+        Sentry.addBreadcrumb({ category: 'voice.semantic', level: 'warning', message: 'voice.semantic_extraction.failed', data: { blockingCaptureKinds: semanticExtraction.assessments.filter((item) => item.disposition === 'rerecord').map((item) => item.captureKind), reasonCodes: semanticExtraction.assessments.map((item) => item.reasonCode), requestId, correlationId } });
+        return res.status(422).json({ error: 'semantic_extraction_rerecord_required', semanticExtraction, requestId, correlationId });
+      }
+      Sentry.addBreadcrumb({ category: 'voice.semantic', level: 'info', message: 'voice.semantic_extraction.completed', data: { semanticContextSha256: semanticExtraction.semanticContextSha256, dispositions: semanticExtraction.assessments.map((item) => `${item.captureKind}:${item.disposition}`), requestId, correlationId } });
+      detectedGender = await detectGender(
+        [transcriptByStage.goal, transcriptByStage.purpose, transcriptByStage.reconnectionAnchor].filter(Boolean),
+        { signal: semanticResolutionController.signal },
+      );
+    } catch (error) {
+      if (!semanticResolutionController.signal.aborted && error?.name !== 'AbortError') throw error;
       audioFiles.forEach((file) => { try { fs.unlinkSync(file); } catch {} });
-      Sentry.addBreadcrumb({ category: 'voice.semantic', level: 'warning', message: 'voice.semantic_extraction.failed', data: { blockingCaptureKinds: semanticExtraction.assessments.filter((item) => item.disposition === 'rerecord').map((item) => item.captureKind), reasonCodes: semanticExtraction.assessments.map((item) => item.reasonCode) } });
-      return res.status(422).json({ error: 'semantic_extraction_rerecord_required', semanticExtraction, requestId, correlationId });
+      Sentry.captureMessage('voice.semantic_resolution.failed', {
+        level: 'warning',
+        tags: { component: 'voice_semantic_resolution', step: 'backend_transcription', failure_kind: 'provider_timeout' },
+        extra: { requestId, correlationId, bundleId, timeoutMs: SEMANTIC_RESOLUTION_TIMEOUT_MS },
+      });
+      return res.status(504).json({
+        error: 'semantic_resolution_timeout',
+        failureKind: 'provider_timeout',
+        stage: 'semantic_resolution',
+        retryAction: 'record_again',
+        timeoutMs: SEMANTIC_RESOLUTION_TIMEOUT_MS,
+        requestId,
+        correlationId,
+      });
+    } finally {
+      clearTimeout(semanticResolutionTimer);
     }
-    Sentry.addBreadcrumb({ category: 'voice.semantic', level: 'info', message: 'voice.semantic_extraction.completed', data: { semanticContextSha256: semanticExtraction.semanticContextSha256, dispositions: semanticExtraction.assessments.map((item) => `${item.captureKind}:${item.disposition}`) } });
-    const detectedGender = await detectGender([transcriptByStage.goal, transcriptByStage.purpose, transcriptByStage.reconnectionAnchor].filter(Boolean));
 
     const sessionId = Date.now().toString();
     const voiceOwnerId = safeVoiceOwnerId(user.id);

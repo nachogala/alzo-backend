@@ -67,12 +67,13 @@ function mockAgentSetup() {
   return agent;
 }
 
-function installOpenAIMock(agent) {
+function installOpenAIMock(agent, { transcriptionDelayMs = 0 } = {}) {
   const pool = agent.get('https://api.openai.com');
-  pool
+  let transcriptionScope = pool
     .intercept({ path: '/v1/audio/transcriptions', method: 'POST' })
-    .reply(200, { text: 'I choose the work, remember the purpose, face resistance, and commit out loud.' })
-    .persist();
+    .reply(200, { text: 'I choose the work, remember the purpose, face resistance, and commit out loud.' });
+  if (transcriptionDelayMs > 0) transcriptionScope = transcriptionScope.delay(transcriptionDelayMs);
+  transcriptionScope.persist();
   pool
     .intercept({ path: '/v1/chat/completions', method: 'POST' })
     .reply(200, {
@@ -114,7 +115,7 @@ function installElevenLabsMock(agent) {
   return state;
 }
 
-async function bootServer({ preserveStorage = false } = {}) {
+async function bootServer({ preserveStorage = false, semanticResolutionTimeoutMs = null } = {}) {
   if (serverHarness) {
     await serverHarness.close();
     serverHarness = null;
@@ -138,6 +139,8 @@ async function bootServer({ preserveStorage = false } = {}) {
   process.env.OPENAI_API_KEY = 'test-openai-key';
   process.env.SENTRY_DSN = '';
   process.env.NODE_ENV = 'test';
+  if (semanticResolutionTimeoutMs == null) delete process.env.SEMANTIC_RESOLUTION_TIMEOUT_MS;
+  else process.env.SEMANTIC_RESOLUTION_TIMEOUT_MS = String(semanticResolutionTimeoutMs);
 
   sentryStub._reset();
   jest.resetModules();
@@ -273,6 +276,30 @@ afterAll(() => {
 });
 
 describe('POST /api/onboarding/voice-bundle', () => {
+  it('hard-aborts backend semantic resolution at the deadline and classifies provider_timeout', async () => {
+    await mockAgent.close();
+    mockAgent = mockAgentSetup();
+    installOpenAIMock(mockAgent, { transcriptionDelayMs: 100 });
+    elevenState = installElevenLabsMock(mockAgent);
+    await bootServer({ semanticResolutionTimeoutMs: 25 });
+
+    const { token, status } = await registerUser();
+    expect(status).toBe(200);
+    const res = await uploadContractBundle(token, 'semantic_timeout');
+
+    expect(res.status).toBe(504);
+    expect(res.body).toMatchObject({
+      error: 'semantic_resolution_timeout',
+      failureKind: 'provider_timeout',
+      stage: 'semantic_resolution',
+      retryAction: 'record_again',
+    });
+    expect(res.body.requestId).toBeTruthy();
+    expect(res.body.correlationId).toBeTruthy();
+    expect(elevenState.cloneCalls).toBe(0);
+    expect(fs.readdirSync(TEST_UPLOADS)).toHaveLength(0);
+  }, 30000);
+
   it('accepts the Build 21 four-capture contract and preserves provenance/session correlation', async () => {
     const { token, userId, status } = await registerUser();
     expect(status).toBe(200);

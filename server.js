@@ -387,7 +387,7 @@ const openai = new Proxy({}, {
 const _DEFAULT_MODEL = process.env.OPENAI_MODEL_DEFAULT || (process.env.DEEPSEEK_API_KEY ? "deepseek-v4-pro" : "gpt-4o");
 const _MINI_MODEL = process.env.OPENAI_MODEL_MINI || (process.env.DEEPSEEK_API_KEY ? "deepseek-v4-flash" : "gpt-4o-mini");
 const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID || "";
-const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "com.alzo.app";
+const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "com.alzo.app3";
 const googleAuthClient = GOOGLE_WEB_CLIENT_ID ? new OAuth2Client(GOOGLE_WEB_CLIENT_ID) : null;
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-12-18.acacia" })
@@ -2315,6 +2315,44 @@ app.post("/api/auth/login", (req, res) => {
   res.json(buildAuthoritativeAuthResponse({ token, user: storedUser, isNewUser: false, provider: 'email' }));
 });
 
+function classifyAppleIdentityTokenFailure(error) {
+  const message = String(error && error.message ? error.message : error || '').toLowerCase();
+  if (/audience|unexpected[^\n]*\baud\b|\baud\b[^\n]*claim/.test(message)) return 'audience_mismatch';
+  if (/expired|expiration|\bexp\b[^\n]*claim|tokenexpir/.test(message)) return 'expired';
+  return 'malformed';
+}
+
+function safeCorrelationHeader(req, headerName) {
+  const value = String(req.get(headerName) || '').trim();
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : 'none';
+}
+
+function captureAppleVerificationFailure(req, reasonCode) {
+  const requestId = safeCorrelationHeader(req, 'x-request-id');
+  const correlationId = safeCorrelationHeader(req, 'x-correlation-id');
+  const sessionId = safeCorrelationHeader(req, 'x-alzo-session-id');
+  const tags = {
+    event_name: 'auth.apple.verify.failed',
+    provider: 'apple',
+    reason_code: reasonCode,
+    http_status: '401',
+    request_id: requestId,
+    correlation_id: correlationId,
+    session_id: sessionId,
+  };
+  const extra = {
+    provider: 'apple',
+    status: 401,
+    reasonCode,
+    requestId,
+    correlationId,
+    sessionId,
+  };
+  try {
+    Sentry.captureMessage('auth.apple.verify.failed', { level: 'warning', tags, extra });
+  } catch (_) {}
+}
+
 // Apple Sign-in: identityToken from frontend, verify signature against Apple JWKS
 app.post("/api/auth/apple", async (req, res) => {
   const { identityToken, email: providedEmail, fullName } = req.body;
@@ -2329,8 +2367,10 @@ app.post("/api/auth/apple", async (req, res) => {
     appleSub = payload.sub;
     tokenEmail = payload.email;
   } catch (e) {
-    console.error("Apple token verification failed:", e.message);
-    return res.status(401).json({ error: "Authentication failed" });
+    const reasonCode = classifyAppleIdentityTokenFailure(e);
+    console.error("Apple token verification failed:", reasonCode);
+    captureAppleVerificationFailure(req, reasonCode);
+    return res.status(401).json({ error: "Authentication failed", reasonCode });
   }
 
   const email = (tokenEmail || providedEmail || "").toLowerCase();

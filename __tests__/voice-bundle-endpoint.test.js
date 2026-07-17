@@ -16,6 +16,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const net = require('net');
+const crypto = require('crypto');
 
 const { execFileSync } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
@@ -510,6 +511,23 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(elevenState.cloneCalls).toBeGreaterThanOrEqual(1);
     expect(elevenState.ttsCalls).toBeGreaterThanOrEqual(1);
     expect(firstMessage.body.audioUrl).toBeTruthy();
+    expect(firstMessage.body.audioProvenance).toMatchObject({
+      schemaVersion: 'alzo.audio_provenance.v1',
+      artifactKind: 'synthesized_first_message',
+      audioUrl: firstMessage.body.audioUrl,
+    });
+    expect(firstMessage.body.audioProvenance.artifactId).toBeTruthy();
+    expect(firstMessage.body.audioProvenance.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(firstMessage.body.audioProvenance.sourceCaptureSha256s).toHaveLength(4);
+    const servedPath = path.join(TEST_AUDIO, path.basename(firstMessage.body.audioUrl));
+    const servedSha256 = crypto.createHash('sha256').update(fs.readFileSync(servedPath)).digest('hex');
+    expect(firstMessage.body.audioProvenance.sha256).toBe(servedSha256);
+    const servedAudio = await request(url()).get(firstMessage.body.audioUrl);
+    expect(servedAudio.status).toBe(200);
+    expect(Buffer.isBuffer(servedAudio.body)).toBe(true);
+    expect(crypto.createHash('sha256').update(servedAudio.body).digest('hex')).toBe(firstMessage.body.audioProvenance.sha256);
+    expect(firstMessage.body.audioProvenance.sourceCaptureSha256s).not.toContain(servedSha256);
+    expect(firstMessage.body.audioProvenance.sha256).not.toBe(manifest.mergedVoiceArtifact.sha256);
 
     expect(firstMessage.body.voiceDebug?.sampleCount).toBe(1);
     expect(firstMessage.body.voiceDebug?.sampleFiles).toHaveLength(1);

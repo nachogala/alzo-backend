@@ -1805,6 +1805,7 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
 
     // 2. Generate audio — use the single R2 merged training artifact only.
     let audioUrl = null;
+    let synthesizedAudioPath = null;
     let voiceDebug = { cloneMode: 'not_ready', fallbackUsed: false, error: null };
 
     // R2 Final: First Message may use only the single merged artifact sealed in
@@ -1844,6 +1845,7 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
       }
       const cloneResult = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language, cachedVoiceId);
       audioUrl = cloneResult.audioUrl;
+      synthesizedAudioPath = cloneResult.localFilePath || null;
       voiceDebug = cloneResult.voiceDebug;
       // Persist the new voice_id so the next affirmation skips the clone step.
       if (authedUser && cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
@@ -1888,11 +1890,34 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     }
 
     const cloneVerified = voiceDebug?.cloneVerified === true;
+    const synthesizedPath = synthesizedAudioPath || path.join(AUDIO_STORAGE_DIR, path.basename(audioUrl));
+    if (!fs.existsSync(synthesizedPath)) {
+      return res.status(502).json({ error: 'synthesized_audio_provenance_unavailable', code: 'AUDIO_PROVENANCE_UNAVAILABLE' });
+    }
+    const synthesizedSha256 = crypto.createHash('sha256').update(fs.readFileSync(synthesizedPath)).digest('hex');
+    const sourceCaptureSha256s = r2Manifest.sourceCaptureFiles.map((sourcePath) => crypto.createHash('sha256').update(fs.readFileSync(sourcePath)).digest('hex'));
+    if (sourceCaptureSha256s.includes(synthesizedSha256)) {
+      Sentry.captureMessage('first_message.audio_provenance.raw_capture_reuse_detected', {
+        level: 'error',
+        tags: { area: 'voice_clone', endpoint: 'generate_affirmation' },
+        extra: { sessionId, synthesizedSha256 },
+      });
+      return res.status(502).json({ error: 'raw_capture_reuse_detected', code: 'RAW_CAPTURE_REUSE_DETECTED' });
+    }
+    const audioProvenance = {
+      schemaVersion: 'alzo.audio_provenance.v1',
+      artifactKind: 'synthesized_first_message',
+      artifactId: path.basename(synthesizedPath),
+      sha256: synthesizedSha256,
+      sourceCaptureSha256s,
+      audioUrl,
+    };
+    Sentry.addBreadcrumb({ category: 'first_message', level: 'info', message: 'first_message.audio_provenance.verified', data: { artifactId: audioProvenance.artifactId, audioSha256: synthesizedSha256, sourceCaptureCount: sourceCaptureSha256s.length } });
     console.log(`[generate-affirmation] result voice-lookup method=${voiceLookupMethod} ` +
       `file=${voicePath ? path.basename(voicePath) : 'null'} ` +
       `sessionId=${sessionId} userId=${lookupUserId || 'null'} ` +
       `cloneMode=${voiceDebug?.cloneMode || 'unknown'}`);
-    res.json({ affirmationText, audioUrl, voiceDebug, clone_verified: cloneVerified });
+    res.json({ affirmationText, audioUrl, audioProvenance, voiceDebug, clone_verified: cloneVerified });
   } catch (err) {
     Sentry.captureException(err, {
       tags: { area: 'voice_clone', endpoint: 'generate_affirmation' },

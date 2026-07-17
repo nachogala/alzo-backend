@@ -12,12 +12,13 @@
  *   '^openai$': '<rootDir>/__tests__/__mocks__/openai-stub.js'
  */
 
+const DEFAULT_CHAT = 'I am finishing the prototype because it supports my family. When it gets difficult, I remember why I began.';
 const _state = {
   chatCalls: 0,
   transcriptionCalls: 0,
   failNext: false,
   responses: {
-    chat: 'I am finishing the prototype because it supports my family. When it gets difficult, I remember why I began.',
+    chat: DEFAULT_CHAT,
     transcription: 'I want to be more present and grow my business.',
   },
 };
@@ -40,6 +41,17 @@ class OpenAIStub {
             _state.failNext = false;
             throw new MockOpenAIError('mock chat completion failure', 503);
           }
+          let content = _state.responses.chat;
+          if (content === DEFAULT_CHAT) {
+            try {
+              const userMessage = [...(params?.messages || [])].reverse().find((item) => item.role === 'user' && String(item.content || '').includes('first_message_input'));
+              const parsed = userMessage ? JSON.parse(userMessage.content) : null;
+              const semantic = parsed?.semanticContext;
+              if (semantic?.goal && semantic?.purpose && semantic?.reconnectionAnchor) {
+                content = `I hold ${semantic.goal}. ${semantic.purpose}. When it gets hard, ${semantic.reconnectionAnchor}.`;
+              }
+            } catch (_) {}
+          }
           return {
             id: 'chatcmpl-mock',
             object: 'chat.completion',
@@ -49,7 +61,7 @@ class OpenAIStub {
               {
                 index: 0,
                 finish_reason: 'stop',
-                message: { role: 'assistant', content: _state.responses.chat },
+                message: { role: 'assistant', content },
               },
             ],
             usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 },
@@ -77,7 +89,7 @@ OpenAIStub._reset = () => {
   _state.chatCalls = 0;
   _state.transcriptionCalls = 0;
   _state.failNext = false;
-  _state.responses.chat = 'I am finishing the prototype because it supports my family. When it gets difficult, I remember why I began.';
+  _state.responses.chat = DEFAULT_CHAT;
   _state.responses.transcription = 'I want to be more present and grow my business.';
 };
 

@@ -289,10 +289,21 @@ function installElevenLabsMock(agent, { ivcExpired = false, captureCallCount = f
 
 function installOpenAIMock(agent) {
   const pool = agent.get('https://api.openai.com');
+  let transcriptionIndex = 0;
+  const captureTranscripts = [
+    'I will finish and launch the prototype.',
+    'This matters because it supports my family and the work I chose.',
+    'When it gets difficult, I remember why I chose to begin.',
+    'I choose to honor this commitment in my own voice.',
+  ];
   // /v1/audio/transcriptions
   pool
     .intercept({ path: '/v1/audio/transcriptions', method: 'POST' })
-    .reply(200, { text: 'I want to be more present and grow my business' })
+    .reply(200, () => {
+      const text = captureTranscripts[transcriptionIndex % captureTranscripts.length];
+      transcriptionIndex += 1;
+      return { text };
+    })
     .persist();
   // /v1/chat/completions  (gender detect, generateAffirmation, chronicle, milestone narrative)
   pool

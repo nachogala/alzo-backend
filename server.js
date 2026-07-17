@@ -57,6 +57,7 @@ const voiceValidator = require("./backend/voice_validator");
 // MP3 instead of an ElevenLabs call. Saves quota; see lib/qa-mock-tts.js.
 const qaMockTts = require("./lib/qa-mock-tts");
 const alzoR2 = require("./lib/alzo-r2-contracts");
+const { uploadCapacityMiddleware } = require('./lib/storageCapacity');
 const dailyContextBoundary = require("./lib/daily-context-boundary");
 const { buildAuthoritativeAuthResponse, normalizeAuthoritativeProfile } = require("./lib/auth-contract");
 const { WIRE_CONTRACT_VERSION, VOICE_MULTIPART_FIELDS, VOICE_DURATION_RULE } = require("./lib/release-contract");
@@ -516,7 +517,7 @@ function _validateAffirmationResponse(resp, model, retry_used) {
   };
 }
 
-async function generateAffirmation(context, language, messageKind = 'first') {
+async function generateAffirmation(context, language, messageKind = 'first', receiptContext = {}) {
   if (language && !String(language).toLowerCase().startsWith('en')) {
     const error = new Error('r2_english_only');
     error.code = 'R2_ENGLISH_ONLY';
@@ -525,6 +526,25 @@ async function generateAffirmation(context, language, messageKind = 'first') {
   const prompt = messageKind === 'daily'
     ? alzoR2.buildDailyPrompt(context)
     : alzoR2.buildFirstPrompt(context);
+  const promptReceipt = {
+    promptVersion: prompt.promptVersion,
+    model: _DEFAULT_MODEL,
+    systemPromptSha256: alzoR2.sha256(prompt.messages[0]?.content || ''),
+    userPromptSha256: alzoR2.sha256(prompt.messages[1]?.content || ''),
+    semanticContextSha256: alzoR2.sha256(JSON.stringify(prompt.semanticContext || {})),
+    messageKind,
+    sessionId: receiptContext.sessionId || null,
+    requestId: receiptContext.requestId || receiptContext.journeyTransactionId || receiptContext.bundleId || null,
+    bundleId: receiptContext.bundleId || null,
+    voiceAttemptId: receiptContext.voiceAttemptId || null,
+    ownerHash: receiptContext.ownerHash || null,
+    accountLookupHash: receiptContext.accountLookupHash || null,
+    journeyId: receiptContext.journeyId || null,
+    journeyTransactionId: receiptContext.journeyTransactionId || null,
+    journeyEpoch: receiptContext.journeyEpoch ?? null,
+  };
+  const receiptTags = { event_name: `${messageKind}_message.prompt.receipt`, prompt_version: prompt.promptVersion, model: _DEFAULT_MODEL, session_id: promptReceipt.sessionId || 'none', request_id: promptReceipt.requestId || 'none', owner_hash: promptReceipt.ownerHash || 'none', account_lookup_hash: promptReceipt.accountLookupHash || 'none', journey_id: promptReceipt.journeyId || 'none', journey_transaction_id: promptReceipt.journeyTransactionId || 'none', journey_epoch: String(promptReceipt.journeyEpoch ?? 'none') };
+  Sentry.captureMessage(`alzo.event.${messageKind}_message.prompt.receipt`, { level: 'info', tags: receiptTags, contexts: { generation_receipt: promptReceipt } });
 
   async function attempt(messages, retryUsed, temperature) {
     let response = null;
@@ -540,7 +560,22 @@ async function generateAffirmation(context, language, messageKind = 'first') {
     }
     const transport = _validateAffirmationResponse(response, _DEFAULT_MODEL, retryUsed);
     const policy = alzoR2.validateMessageText(transport.text || '');
-    return { ok: transport.ok && policy.ok, transport, policy };
+    const grounding = messageKind === 'first' && transport.text
+      ? alzoR2.validateFirstMessageGrounding(transport.text, context)
+      : { ok: true, failureCodes: [], matched: {} };
+    const outputReceipt = {
+      ...promptReceipt,
+      retryUsed,
+      providerResponseId: response?.id || null,
+      outputSha256: alzoR2.sha256(transport.text || ''),
+      outputLength: transport.content_length,
+      policyOk: policy.ok,
+      groundingOk: grounding.ok,
+      groundingFailureCodes: grounding.failureCodes,
+      recognizableInputs: Object.keys(grounding.matched || {}).filter((key) => grounding.matched[key]?.recognizable === true),
+    };
+    Sentry.captureMessage(`alzo.event.${messageKind}_message.output.receipt`, { level: policy.ok && grounding.ok ? 'info' : 'warning', tags: { ...receiptTags, event_name: `${messageKind}_message.output.receipt`, grounding_ok: String(grounding.ok), provider_response_id: outputReceipt.providerResponseId || 'none', output_hash: outputReceipt.outputSha256 }, contexts: { generation_receipt: outputReceipt } });
+    return { ok: transport.ok && policy.ok && grounding.ok, transport, policy: { ...policy, failureCodes: [...(policy.failureCodes || []), ...(grounding.failureCodes || [])] }, grounding };
   }
 
   const first = await attempt(prompt.messages, false, 0.35);
@@ -1100,6 +1135,20 @@ function safeVoiceOwnerId(userId) {
   return userId ? String(userId).replace(/[^a-zA-Z0-9_-]/g, '') : null;
 }
 
+function hashLookupValue(value) {
+  if (!value) return null;
+  const input = String(value);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    h1 ^= code;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ code, 0x85ebca6b) >>> 0;
+  }
+  return `${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`.slice(0, 16);
+}
+
 
 function escapeFfmpegConcatPath(filePath) {
   return String(filePath).replace(/'/g, "'\\''");
@@ -1332,7 +1381,38 @@ async function detectGender(transcriptions, { signal } = {}) {
   }
 }
 
-app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req, res) => {
+function observeUploadCapacity(stage, receipt, req) {
+  const user = getUserByToken(req);
+  const requestId = req.get('x-request-id') || null;
+  const correlationId = req.get('x-correlation-id') || req.get('x-voice-attempt-id') || requestId;
+  Sentry.captureMessage('alzo.event.upload.storage.capacity.receipt', {
+    level: stage === 'healthy' ? 'info' : 'error',
+    tags: {
+      event_name: 'upload.storage.capacity.receipt',
+      storage_status: stage,
+      request_id: requestId || 'none',
+      correlation_id: correlationId || 'none',
+      owner_hash: hashLookupValue(user?.id) || 'none',
+      reason_code: receipt.error || 'none',
+    },
+    contexts: {
+      storage_capacity: {
+        stage,
+        requestId,
+        correlationId,
+        ownerHash: hashLookupValue(user?.id),
+        freeBytesBefore: receipt.before?.freeBytes ?? null,
+        freeBytesAfter: receipt.after?.freeBytes ?? null,
+        minFreeBytes: receipt.minFreeBytes ?? null,
+        bytesReclaimed: receipt.cleanup?.bytesReclaimed ?? 0,
+        filesDeleted: receipt.cleanup?.deleted ?? 0,
+        error: receipt.error || null,
+      },
+    },
+  });
+}
+
+app.post("/api/onboarding/voice-bundle", uploadCapacityMiddleware(UPLOAD_STORAGE_DIR, { observe: observeUploadCapacity }), preAccountVoiceBundleUpload, async (req, res) => {
   const requestId = req.get('x-request-id') || crypto.randomUUID();
   const correlationId = req.get('x-correlation-id') || req.get('x-voice-attempt-id') || req.body?.bundleId || requestId;
   const startedAt = Date.now();
@@ -1745,7 +1825,7 @@ app.post("/api/onboarding", onboardingUpload, async (req, res) => {
 // ── Generate affirmation endpoint ───────────────────────────────────
 app.post("/api/generate-affirmation", express.json(), async (req, res) => {
   try {
-    const { context, sessionId, language, detectedGender } = req.body;
+    const { context, sessionId, language, detectedGender, bundleId, voiceAttemptIds, journeyId, journeyTransactionId, journeyEpoch } = req.body;
     const gender = detectedGender;
     if (!context) {
       return res.status(400).json({ error: "Context is required" });
@@ -1754,6 +1834,17 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
     const authedUser = getUserByToken(req);
     if (!authedUser) return res.status(401).json({ error: 'authentication_required_for_r2_first_message' });
     const expectedVoiceOwnerId = safeVoiceOwnerId(authedUser.id);
+    const generationReceiptContext = {
+      sessionId,
+      requestId: String(req.headers['x-request-id'] || journeyTransactionId || bundleId || sessionId),
+      bundleId: bundleId || null,
+      voiceAttemptId: Array.isArray(voiceAttemptIds) ? voiceAttemptIds[voiceAttemptIds.length - 1] || null : null,
+      ownerHash: hashLookupValue(authedUser.id),
+      accountLookupHash: hashLookupValue(String(authedUser.email || '').trim().toLowerCase()),
+      journeyId: journeyId || null,
+      journeyTransactionId: journeyTransactionId || null,
+      journeyEpoch: Number.isFinite(Number(journeyEpoch)) ? Number(journeyEpoch) : null,
+    };
     const manifestPath = path.join(UPLOAD_STORAGE_DIR, `voice_manifest_${sessionId}.json`);
     let r2Manifest = null;
     try { r2Manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch {}
@@ -1801,7 +1892,7 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
 
     // 1. Generate the source-grounded First Message from manifest context only.
     Sentry.addBreadcrumb({ category: 'first_message', level: 'info', message: 'first_message.generation.started', data: { semanticContextSha256: r2Manifest.semanticContextSha256 } });
-    const affirmationText = await generateAffirmation(authoritativeContext, language, 'first');
+    const affirmationText = await generateAffirmation(authoritativeContext, language, 'first', generationReceiptContext);
 
     // 2. Generate audio — use the single R2 merged training artifact only.
     let audioUrl = null;

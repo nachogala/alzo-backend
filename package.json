@@ -7,6 +7,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "qa:voice-static": "node scripts/voice-pipeline-static-check.js",
+    "qa:runtime-structural-p0": "node scripts/qa-runtime-structural-p0.js",
     "test": "jest --runInBand",
     "test:voice": "jest --runInBand __tests__/voice-flow.test.js"
   },

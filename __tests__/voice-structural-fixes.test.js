@@ -96,6 +96,9 @@ async function bootServer() {
 
   sentryStub._reset();
   jest.resetModules();
+  const serverHandlesBefore = new Set(
+    process._getActiveHandles().filter((handle) => handle?.constructor?.name === 'Server')
+  );
   require(path.join(backendRoot, 'server.js'));
 
   const deadline = Date.now() + 8000;
@@ -109,7 +112,26 @@ async function bootServer() {
     if (!bound) await new Promise((r) => setTimeout(r, 150));
   }
   if (!bound) throw new Error('server did not bind');
-  serverHarness = { port, close: async () => {} };
+  const serverHandle = process._getActiveHandles().find(
+    (handle) => handle?.constructor?.name === 'Server' && !serverHandlesBefore.has(handle)
+  );
+  if (!serverHandle) throw new Error('server handle not found for deterministic cleanup');
+  serverHarness = {
+    port,
+    close: () => new Promise((resolve) => {
+      const timer = setTimeout(resolve, 1000);
+      timer.unref?.();
+      try {
+        serverHandle.close(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      } catch {
+        clearTimeout(timer);
+        resolve();
+      }
+    }),
+  };
   return port;
 }
 
@@ -159,7 +181,9 @@ afterEach(async () => {
   await mockAgent?.close();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  if (serverHarness) await serverHarness.close();
+  serverHarness = null;
   try { fs.rmSync(TEST_ROOT, { recursive: true, force: true }); } catch {}
 });
 

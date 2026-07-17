@@ -5,6 +5,11 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
+const {
+  COMMITMENT_TEXT,
+  COMMITMENT_VERSION,
+  COMMITMENT_SHA256,
+} = require('../../lib/alzo-r2-contracts');
 
 const CAPTURE_ORDER = ['goal', 'purpose', 'reconnectionAnchor', 'commitment'];
 let cachedAudio;
@@ -35,6 +40,11 @@ function provenanceFor(bundleId) {
       signalClass: 'human_voice_detected',
       validAudioDurationMs: 10100,
       sha256: 'a'.repeat(64),
+      ...(stage === 'commitment' ? {
+        text: COMMITMENT_TEXT,
+        copyVersion: COMMITMENT_VERSION,
+        copySha256: COMMITMENT_SHA256,
+      } : {}),
     })),
   };
 }

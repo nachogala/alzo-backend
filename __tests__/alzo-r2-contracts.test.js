@@ -3,10 +3,12 @@
 const r2 = require('../lib/alzo-r2-contracts');
 
 describe('ALZO R2 Final contracts', () => {
-  test('locks Commitment E byte-for-byte and outside semantic context', () => {
-    expect(r2.COMMITMENT_VERSION).toBe('alzo.commitment.fixed.en.v1');
+  test('locks Commitment v2 byte-for-byte and outside semantic context', () => {
+    expect(r2.COMMITMENT_VERSION).toBe('alzo.commitment.fixed.en.v2');
+    expect(r2.COMMITMENT_TEXT).toBe("Today I choose to become a better version of myself. I'll give my attention to what truly matters. If I lose my way, I'll come back. This promise is mine.");
+    expect(r2.COMMITMENT_SHA256).toBe('d7c4dbce37fd690e66d92d7e909cd901df5262d9306347ce202b892a00ad3baf');
     expect(r2.sha256(r2.COMMITMENT_TEXT)).toBe(r2.COMMITMENT_SHA256);
-    expect(r2.COMMITMENT_TEXT.split(/\s+/)).toHaveLength(44);
+    expect(r2.COMMITMENT_TEXT.split(/\s+/)).toHaveLength(30);
     const result = r2.buildSemanticExtraction({
       goal: { captureId: 'g', transcript: 'I will finish my portfolio in ninety days.', goalConcrete: true },
       purpose: { captureId: 'p', transcript: 'I want to trust my creative direction.' },
@@ -15,6 +17,22 @@ describe('ALZO R2 Final contracts', () => {
     expect(result.status).toBe('ready');
     expect(Object.keys(result.semanticContext)).toEqual(['goal', 'purpose', 'reconnectionAnchor']);
     expect(JSON.stringify(result.semanticContext)).not.toMatch(/commitment|journal/i);
+  });
+
+  test('validates the fourth Commitment capture fail-closed against v2 text, version and hash', () => {
+    const validCommitmentCapture = {
+      stage: 'commitment',
+      text: r2.COMMITMENT_TEXT,
+      copyVersion: r2.COMMITMENT_VERSION,
+      copySha256: r2.COMMITMENT_SHA256,
+    };
+    expect(r2.validateCommitmentCapture(validCommitmentCapture)).toMatchObject({ ok: true, failureCodes: [] });
+    expect(r2.validateCommitmentCapture({ ...validCommitmentCapture, copyVersion: 'alzo.commitment.fixed.en.v1' }).failureCodes).toContain('commitment_copy_version_mismatch');
+    expect(r2.validateCommitmentCapture({ ...validCommitmentCapture, text: r2.COMMITMENT_TEXT.replace(/I'll/g, 'I’ll') }).failureCodes).toContain('commitment_copy_text_mismatch');
+    expect(r2.validateCommitmentCapture({ ...validCommitmentCapture, copySha256: '0'.repeat(64) }).failureCodes).toContain('commitment_copy_hash_mismatch');
+    expect(r2.validateCommitmentCapture(validCommitmentCapture, { captureIndex: 2, captureCount: 4 }).failureCodes).toContain('commitment_capture_position_invalid');
+    expect(r2.validateCommitmentCapture(validCommitmentCapture, { captureIndex: 3, captureCount: 5 }).failureCodes).toContain('commitment_capture_count_invalid');
+    expect(r2.validateCommitmentCapture(null).failureCodes).toContain('commitment_capture_contract_missing');
   });
 
   test('Goal is strict while Purpose and Anchor can transcript-mirror', () => {
@@ -156,6 +174,12 @@ describe('ALZO R2 Final contracts', () => {
     providerFileCount: 1,
     provenanceComplete: true,
     orderedCaptureKinds: r2.CAPTURE_ORDER,
+    commitmentCapture: {
+      stage: 'commitment',
+      text: r2.COMMITMENT_TEXT,
+      copyVersion: r2.COMMITMENT_VERSION,
+      copySha256: r2.COMMITMENT_SHA256,
+    },
   };
 
   test.each([
@@ -166,6 +190,8 @@ describe('ALZO R2 Final contracts', () => {
     ['noise predominant', { noisePredominant: true }, false, 'noise_predominant'],
     ['four provider files', { providerFileCount: 4 }, false, 'provider_file_count_not_one'],
     ['Commitment missing', { sourceCount: 3, orderedCaptureKinds: ['goal', 'purpose', 'reconnectionAnchor'] }, false, 'capture_missing'],
+    ['Commitment contract missing', { commitmentCapture: null }, false, 'commitment_capture_contract_missing'],
+    ['Commitment text mismatch', { commitmentCapture: { ...valid.commitmentCapture, text: `${r2.COMMITMENT_TEXT} ` } }, false, 'commitment_copy_text_mismatch'],
   ])('audio gate: %s', (_name, patch, expectedOk, expectedCode) => {
     const result = r2.validateTrainingBundle({ ...valid, ...patch });
     expect(result.ok).toBe(expectedOk);

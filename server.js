@@ -1119,7 +1119,7 @@ function runExecFile(command, args, options = {}) {
   });
 }
 
-async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceipt, voiceAttemptIds, orderedCaptureKinds, provenanceComplete }) {
+async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceipt, voiceAttemptIds, orderedCaptureKinds, provenanceComplete, commitmentCapture }) {
   const files = (sourceFiles || []).filter(Boolean);
   if (files.length !== 4) {
     return { ok: false, error: 'merged_voice_source_count_required', expected: 4, actual: files.length };
@@ -1190,6 +1190,7 @@ async function createMergedVoiceArtifact({ sessionId, sourceFiles, captureReceip
     providerFileCount: 1,
     provenanceComplete: provenanceComplete === true,
     orderedCaptureKinds,
+    commitmentCapture,
   });
   if (!qualityGate.ok) {
     try { fs.unlinkSync(mergedPath); } catch {}
@@ -1386,6 +1387,25 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
     const transcriptions = [];
     const captureReceipt = [];
     const provenanceCaptures = Array.isArray(productProvenance?.captures) ? productProvenance.captures : [];
+    const commitmentCapture = provenanceCaptures[3] || null;
+    const commitmentValidation = alzoR2.validateCommitmentCapture(commitmentCapture, {
+      captureIndex: 3,
+      captureCount: provenanceCaptures.length,
+    });
+    if (!commitmentValidation.ok) {
+      audioFiles.forEach((file) => { try { fs.unlinkSync(file); } catch {} });
+      return res.status(400).json({
+        error: 'voice_bundle_commitment_contract_invalid',
+        failureCodes: commitmentValidation.failureCodes,
+        required: {
+          stage: 'commitment',
+          copyVersion: alzoR2.COMMITMENT_VERSION,
+          copySha256: alzoR2.COMMITMENT_SHA256,
+        },
+        requestId,
+        correlationId,
+      });
+    }
     const semanticResolutionController = new AbortController();
     const semanticResolutionTimer = setTimeout(() => semanticResolutionController.abort(), SEMANTIC_RESOLUTION_TIMEOUT_MS);
     semanticResolutionTimer.unref?.();
@@ -1473,6 +1493,7 @@ app.post("/api/onboarding/voice-bundle", preAccountVoiceBundleUpload, async (req
       voiceAttemptIds,
       orderedCaptureKinds: semanticCaptureOrder,
       provenanceComplete: captureReceipt.every((item) => item.captureId && item.voiceAttemptId),
+      commitmentCapture,
     });
     if (!mergeResult.ok) {
       audioFiles.forEach((f) => { try { fs.unlink(f, () => {}); } catch {} });

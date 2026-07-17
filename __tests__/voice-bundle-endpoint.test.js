@@ -30,6 +30,7 @@ const {
   FormData: UndiciFormData,
 } = require('undici');
 const request = require('supertest');
+const alzoR2 = require('../lib/alzo-r2-contracts');
 
 // Force undici fetch so MockAgent intercepts server.js transcription calls.
 globalThis.fetch = undiciFetch;
@@ -184,8 +185,17 @@ async function bootServer({ preserveStorage = false, semanticResolutionTimeoutMs
     port,
     close: () => new Promise((resolve) => {
       if (newServer && typeof newServer.close === 'function') {
-        try { newServer.close(() => resolve()); } catch { resolve(); }
-        setTimeout(resolve, 1000);
+        const timer = setTimeout(resolve, 1000);
+        timer.unref?.();
+        try {
+          newServer.close(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        } catch {
+          clearTimeout(timer);
+          resolve();
+        }
       } else {
         resolve();
       }
@@ -233,7 +243,20 @@ async function registerUser() {
   return { email, password, token: res.body?.token, userId: res.body?.userId, status: res.status };
 }
 
-async function uploadContractBundle(token, suffix = 'lifecycle') {
+function provenanceCapture(stage, index, suffix = '') {
+  return {
+    captureId: `capture_${suffix ? `${suffix}_` : ''}${index + 1}_${stage}`,
+    stage,
+    signalClass: 'human_voice_detected',
+    ...(stage === 'commitment' ? {
+      text: alzoR2.COMMITMENT_TEXT,
+      copyVersion: alzoR2.COMMITMENT_VERSION,
+      copySha256: alzoR2.COMMITMENT_SHA256,
+    } : {}),
+  };
+}
+
+async function uploadContractBundle(token, suffix = 'lifecycle', commitmentPatch = {}) {
   const bundleId = `bundle_${suffix}_${Date.now()}`;
   const ordered = ['goal', 'purpose', 'reconnectionAnchor', 'commitment'];
   const voiceAttemptIds = ordered.map((stage, index) => `attempt_${suffix}_${index + 1}_${stage}`);
@@ -241,7 +264,10 @@ async function uploadContractBundle(token, suffix = 'lifecycle') {
     build: 24,
     source: 'alzo3-pre-account-voice-bundle',
     requiredCaptureKeys: ordered,
-    captures: ordered.map((stage, index) => ({ captureId: `capture_${suffix}_${index + 1}_${stage}`, stage, signalClass: 'human_voice_detected' })),
+    captures: ordered.map((stage, index) => {
+      const capture = provenanceCapture(stage, index, suffix);
+      return stage === 'commitment' ? { ...capture, ...commitmentPatch } : capture;
+    }),
   };
   const voiceProcessingPayload = {
     schemaVersion: 'pre_account_voice_bundle.v1',
@@ -285,6 +311,19 @@ afterAll(() => {
 });
 
 describe('POST /api/onboarding/voice-bundle', () => {
+  it('rejects a fourth Commitment capture whose canonical v2 text does not match', async () => {
+    const { token, status } = await registerUser();
+    expect(status).toBe(200);
+    const res = await uploadContractBundle(token, 'commitment_mismatch', {
+      text: alzoR2.COMMITMENT_TEXT.replace(/I'll/g, 'I’ll'),
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ error: 'voice_bundle_commitment_contract_invalid' });
+    expect(res.body.failureCodes).toContain('commitment_copy_text_mismatch');
+    expect(elevenState.cloneCalls).toBe(0);
+    expect(fs.readdirSync(TEST_UPLOADS)).toHaveLength(0);
+  }, 30000);
+
   it('hard-aborts backend semantic resolution at the deadline and classifies provider_timeout', async () => {
     await mockAgent.close();
     mockAgent = mockAgentSetup();
@@ -368,7 +407,7 @@ describe('POST /api/onboarding/voice-bundle', () => {
       build: 24,
       source: 'alzo3-pre-account-voice-bundle',
       requiredCaptureKeys: semanticCaptureOrder,
-      captures: semanticCaptureOrder.map((stage, index) => ({ captureId: `capture_${index + 1}_${stage}`, stage, signalClass: 'human_voice_detected' })),
+      captures: semanticCaptureOrder.map((stage, index) => provenanceCapture(stage, index)),
     };
     const voiceProcessingPayload = {
       schemaVersion: 'pre_account_voice_bundle.v1',

@@ -2462,6 +2462,39 @@ app.post("/api/auth/apple", async (req, res) => {
   }));
 });
 
+function classifyGoogleIdTokenFailure(error) {
+  const message = String(error && error.message ? error.message : error || '').toLowerCase();
+  if (/audience|wrong recipient|requiredaudience|\baud\b[^\n]*claim/.test(message)) return 'audience_mismatch';
+  if (/expired|too late|expiration|tokenexpir/.test(message)) return 'expired';
+  return 'malformed';
+}
+
+function captureGoogleVerificationFailure(req, reasonCode) {
+  const requestId = safeCorrelationHeader(req, 'x-request-id');
+  const correlationId = safeCorrelationHeader(req, 'x-correlation-id');
+  const sessionId = safeCorrelationHeader(req, 'x-alzo-session-id');
+  const tags = {
+    event_name: 'auth.google.verify.failed',
+    provider: 'google',
+    reason_code: reasonCode,
+    http_status: '401',
+    request_id: requestId,
+    correlation_id: correlationId,
+    session_id: sessionId,
+  };
+  const extra = {
+    provider: 'google',
+    status: 401,
+    reasonCode,
+    requestId,
+    correlationId,
+    sessionId,
+  };
+  try {
+    Sentry.captureMessage('auth.google.verify.failed', { level: 'warning', tags, extra });
+  } catch (_) {}
+}
+
 // Google Sign-in: idToken from frontend, verify signature against Google JWKS
 app.post("/api/auth/google", async (req, res) => {
   const { idToken, email: providedEmail, name: providedName } = req.body;
@@ -2481,8 +2514,10 @@ app.post("/api/auth/google", async (req, res) => {
     googleSub = payload.sub;
     tokenEmail = payload.email;
   } catch (e) {
-    console.error("Google token verification failed:", e.message);
-    return res.status(401).json({ error: "Authentication failed" });
+    const reasonCode = classifyGoogleIdTokenFailure(e);
+    console.error("Google token verification failed:", reasonCode);
+    captureGoogleVerificationFailure(req, reasonCode);
+    return res.status(401).json({ error: "Authentication failed", reasonCode });
   }
 
   const email = (tokenEmail || providedEmail || "").toLowerCase();

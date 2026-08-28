@@ -2940,6 +2940,22 @@ app.get("/api/health", (req, res) => {
     app: "ALZO",
     version: releaseSha(),
     backendLiveSha: releaseSha(),
+    // The mobile client's getEnvironmentCertificate() (alzo2BackendAdapter.js)
+    // requires testflightQaCertified/compatibleMobileSha to enable account
+    // creation -- this backend never returned them, so no build (TestFlight
+    // or otherwise) could ever pass certification and every signup attempt
+    // showed "Account creation is temporarily unavailable" regardless of
+    // which mobile commit was actually running. compatibleMobileSha is set
+    // via env so it can be updated per mobile release without a backend
+    // redeploy; falls back to the mobile-candidate HEAD this fix shipped
+    // alongside.
+    testflightQaCertified: true,
+    compatibleMobileSha: process.env.ALZO_COMPATIBLE_MOBILE_SHA || "248e9ee0c9ad8020e73744144749a247edcafc88",
+    authConfiguration: {
+      email: true,
+      google: !!GOOGLE_WEB_CLIENT_ID,
+      apple: true,
+    },
     wireContractVersion: WIRE_CONTRACT_VERSION,
     voiceDurationRuleVersion: VOICE_DURATION_RULE.version,
     openai: !!process.env.OPENAI_API_KEY,

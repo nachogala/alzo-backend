@@ -560,6 +560,14 @@ async function generateAffirmation(context, language, messageKind = 'first', rec
     }
     const transport = _validateAffirmationResponse(response, _DEFAULT_MODEL, retryUsed);
     const policy = alzoR2.validateMessageText(transport.text || '');
+    // validateFirstMessageGrounding requires literal phrase/word overlap with
+    // the user's raw transcript -- that directly contradicts FIRST_SYSTEM_PROMPT
+    // now explicitly asking the model NOT to quote or closely paraphrase Goal/
+    // Purpose/Reconnection Anchor (2026-08-30 change, so the first message reads
+    // as a genuinely new reflection rather than the user's own words reordered).
+    // Still computed and recorded on the receipt below for observability, but no
+    // longer gates success -- daily messages never had this gate either and
+    // produce good results without it.
     const grounding = messageKind === 'first' && transport.text
       ? alzoR2.validateFirstMessageGrounding(transport.text, context)
       : { ok: true, failureCodes: [], matched: {} };
@@ -574,8 +582,8 @@ async function generateAffirmation(context, language, messageKind = 'first', rec
       groundingFailureCodes: grounding.failureCodes,
       recognizableInputs: Object.keys(grounding.matched || {}).filter((key) => grounding.matched[key]?.recognizable === true),
     };
-    Sentry.captureMessage(`alzo.event.${messageKind}_message.output.receipt`, { level: policy.ok && grounding.ok ? 'info' : 'warning', tags: { ...receiptTags, event_name: `${messageKind}_message.output.receipt`, grounding_ok: String(grounding.ok), provider_response_id: outputReceipt.providerResponseId || 'none', output_hash: outputReceipt.outputSha256 }, contexts: { generation_receipt: outputReceipt } });
-    return { ok: transport.ok && policy.ok && grounding.ok, transport, policy: { ...policy, failureCodes: [...(policy.failureCodes || []), ...(grounding.failureCodes || [])] }, grounding };
+    Sentry.captureMessage(`alzo.event.${messageKind}_message.output.receipt`, { level: policy.ok ? 'info' : 'warning', tags: { ...receiptTags, event_name: `${messageKind}_message.output.receipt`, grounding_ok: String(grounding.ok), provider_response_id: outputReceipt.providerResponseId || 'none', output_hash: outputReceipt.outputSha256 }, contexts: { generation_receipt: outputReceipt } });
+    return { ok: transport.ok && policy.ok, transport, policy, grounding };
   }
 
   const first = await attempt(prompt.messages, false, 0.35);

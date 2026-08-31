@@ -3511,10 +3511,24 @@ app.use((err, req, res, next) => {
 Sentry.setupExpressErrorHandler(app);
 
 // ── Start server ────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
+const httpServer = app.listen(PORT, '0.0.0.0', () => {
   console.log(`ALZO server running on port ${PORT}`);
   console.log(`ElevenLabs: ${ELEVENLABS_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`OpenAI: ${process.env.OPENAI_API_KEY ? 'enabled' : 'MISSING'}`);
   console.log(`Sentry: ${process.env.SENTRY_DSN ? 'enabled' : 'disabled'}`);
   console.log(`Endpoints: goals, checkin, mirror, plants, garden, journal, messages, milestones, share`);
 });
+
+// Railway sends SIGTERM to the old container on every deploy as a normal,
+// intentional shutdown. Without a handler, Node dies on the raw signal and
+// npm (which wraps `node server.js`) logs it as "npm error signal SIGTERM" --
+// which reads exactly like a crash and appears to be what Railway's deploy
+// monitor keys off to send "Deploy Crashed" alerts on otherwise-healthy
+// deploys. Exiting cleanly on SIGTERM avoids that false alarm.
+function shutdownGracefully(signal) {
+  console.log(`${signal} received, closing server gracefully`);
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+process.on('SIGINT', () => shutdownGracefully('SIGINT'));

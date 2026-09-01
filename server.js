@@ -2064,6 +2064,41 @@ app.post("/api/daily-message", express.json(), async (req, res) => {
   }
 });
 
+// ── Transcribe a single audio clip (2026-09-01, 7-Day Goal capture) ──
+// Lightweight sibling of the 4-part onboarding voice-bundle transcription
+// above: authenticated users only (this runs post-account, unlike
+// onboarding), one file in, one transcript out. No cloning, no semantic-
+// capture bundle, no journey validation -- the 7-Day flow doesn't need any
+// of that, since the user's voice is already cloned and this is a single
+// short spoken goal, not a new voice identity.
+app.post("/api/transcribe", upload.single('audio'), async (req, res) => {
+  const requestId = req.get('x-request-id') || crypto.randomUUID();
+  try {
+    const user = getUserByToken(req);
+    if (!user) {
+      if (req.file) { try { fs.unlinkSync(req.file.path); } catch {} }
+      return res.status(401).json({ error: 'authentication_required_for_transcription', requestId });
+    }
+    if (!req.file) return res.status(400).json({ error: 'audio_file_required', requestId });
+    const language = req.body?.language || user.language || 'en-US';
+    let transcription;
+    try {
+      transcription = await transcribeAudio(req.file.path, language);
+    } finally {
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
+    if (!transcription || transcription.trim().length < 3) {
+      return res.status(422).json({ error: 'transcription_empty_or_failed', requestId });
+    }
+    return res.json({ transcript: transcription.trim(), requestId });
+  } catch (error) {
+    if (req.file) { try { fs.unlinkSync(req.file.path); } catch {} }
+    Sentry.captureException(error, { tags: { area: 'transcribe', endpoint: '/api/transcribe' }, extra: { requestId } });
+    console.error("Transcription endpoint error:", error.message);
+    return res.status(500).json({ error: "transcription_failed", requestId });
+  }
+});
+
 // ── Daily affirmation (lazy generation, one per user per day) ───────
 // App hits this when opening the home screen. If the user already has today's
 // affirmation, return it instantly. Otherwise generate it on-demand using the

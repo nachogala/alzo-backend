@@ -2504,13 +2504,22 @@ app.post("/api/auth/signup", (req, res) => {
   });
 });
 
+// SECURITY FIX (2026-09-29): this endpoint used to accept {email, newPassword}
+// with NO identity verification — anyone knowing an email could take over the
+// account (demonstrated live during the owner-authorized user wipe). It now
+// requires the account's CURRENT password, making it an authenticated change.
+// No client shipped uses this endpoint; a true email-delivered recovery flow
+// can replace it later.
 app.post("/api/auth/reset-password", (req, res) => {
-  const { email, newPassword } = req.body;
+  const { email, currentPassword, newPassword } = req.body;
   if (!email || !newPassword) return res.status(400).json({ error: "Email and new password are required" });
   if (newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  if (!currentPassword) return res.status(400).json({ error: "Current password is required" });
 
   const user = stmts.getByEmail.get(email.toLowerCase());
-  if (!user) return res.status(404).json({ error: "Account not found" });
+  if (!user || user.passwordHash !== hashPassword(currentPassword)) {
+    return res.status(401).json({ error: "Invalid email or password" });
+  }
 
   db.prepare("UPDATE users SET passwordHash = ? WHERE email = ?").run(hashPassword(newPassword), email.toLowerCase());
   res.json({ success: true });

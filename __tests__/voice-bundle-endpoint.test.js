@@ -60,6 +60,7 @@ function pickFreePort() {
 let serverHarness;
 let mockAgent;
 let elevenState;
+let transcriptionCalls;
 
 function mockAgentSetup() {
   const agent = new MockAgent();
@@ -81,7 +82,7 @@ function installOpenAIMock(agent, { transcriptionDelayMs = 0, transcriptionPlan 
   } else {
     let transcriptionScope = pool
       .intercept({ path: '/v1/audio/transcriptions', method: 'POST' })
-      .reply(200, { text: 'I choose the work, remember the purpose, face resistance, and commit out loud.' });
+      .reply(200, () => { transcriptionCalls += 1; return { text: 'I choose the work, remember the purpose, face resistance, and commit out loud.' }; });
     if (transcriptionDelayMs > 0) transcriptionScope = transcriptionScope.delay(transcriptionDelayMs);
     transcriptionScope.persist();
   }
@@ -257,11 +258,11 @@ function provenanceCapture(stage, index, suffix = '') {
   };
 }
 
-async function uploadContractBundle(token, suffix = 'lifecycle', commitmentPatch = {}) {
+async function uploadContractBundle(token, suffix = 'lifecycle', commitmentPatch = {}, productProvenanceOverride = null) {
   const bundleId = `bundle_${suffix}_${Date.now()}`;
   const ordered = ['goal', 'purpose', 'reconnectionAnchor', 'commitment'];
   const voiceAttemptIds = ordered.map((stage, index) => `attempt_${suffix}_${index + 1}_${stage}`);
-  const productProvenance = {
+  const productProvenance = productProvenanceOverride || {
     build: 24,
     source: 'alzo3-pre-account-voice-bundle',
     requiredCaptureKeys: ordered,
@@ -294,6 +295,7 @@ async function uploadContractBundle(token, suffix = 'lifecycle', commitmentPatch
 }
 
 beforeEach(async () => {
+  transcriptionCalls = 0;
   mockAgent = mockAgentSetup();
   installOpenAIMock(mockAgent);
   elevenState = installElevenLabsMock(mockAgent);
@@ -312,6 +314,61 @@ afterAll(() => {
 });
 
 describe('POST /api/onboarding/voice-bundle', () => {
+  const mobileModule = process.env.ALZO_MOBILE_CONTRACT_MODULE;
+  (mobileModule ? it : it.skip)('accepts productProvenance made by the actual mobile bundle module', async () => {
+    const mobile = require(mobileModule);
+    const copy = require(path.join(path.dirname(mobileModule), 'onboardingCopy'));
+    let onboarding = {};
+    for (const [index, stage] of ['goal', 'purpose', 'resistance', 'commitmentReading'].entries()) {
+      onboarding = mobile.upsertSemanticCapture(onboarding, {
+        stage, captureId: `actual_mobile_${stage}`,
+        localUri: `file:///synthetic/${stage}.m4a`,
+        durationMs: [11000, 11000, 11000, 20000][index],
+        semanticValue: stage === 'commitmentReading' ? copy.COMMITMENT_TEXT : `Synthetic ${stage} answer`,
+        validationStatus: 'accepted',
+      }).onboarding;
+    }
+    const built = mobile.buildPreAccountVoiceBundle(onboarding);
+    expect(built.ok).toBe(true);
+    const mobilePayload = mobile.buildVoiceProcessingPayloadFromBundle({ bundle: built.bundle });
+    expect(mobilePayload.ok).toBe(true);
+    const { token, status } = await registerUser();
+    expect(status).toBe(200);
+    const before = transcriptionCalls;
+    const accepted = await uploadContractBundle(token, 'actual_mobile_v3', {}, mobilePayload.payload.productProvenance);
+    expect(accepted.status).toBe(200);
+    expect(transcriptionCalls).toBeGreaterThan(before);
+    const bad = structuredClone(mobilePayload.payload.productProvenance);
+    bad.captures[3].copySha256 = alzoR2.COMMITMENT_SHA256;
+    const beforeBad = transcriptionCalls;
+    const rejected = await uploadContractBundle(token, 'actual_mobile_mixed', {}, bad);
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.error).toBe('voice_bundle_commitment_contract_invalid');
+    expect(transcriptionCalls).toBe(beforeBad);
+  }, 60000);
+  it('accepts exact v3 and rejects mixed v2/v3 tuples before any paid transcription', async () => {
+    const { token, status } = await registerUser();
+    expect(status).toBe(200);
+    const v3 = {
+      text: alzoR2.COMMITMENT_V3_TEXT,
+      copyVersion: alzoR2.COMMITMENT_V3_VERSION,
+      copySha256: alzoR2.COMMITMENT_V3_SHA256,
+    };
+    const accepted = await uploadContractBundle(token, 'approved_v3', v3);
+    expect(accepted.status).toBe(200);
+    for (const [index, patch] of [
+      { ...v3, copyVersion: alzoR2.COMMITMENT_VERSION },
+      { ...v3, copySha256: alzoR2.COMMITMENT_SHA256 },
+      { ...v3, text: alzoR2.COMMITMENT_TEXT },
+      { ...v3, text: `${v3.text} ` },
+    ].entries()) {
+      const before = transcriptionCalls;
+      const rejected = await uploadContractBundle(token, `mixed_v3_${index}`, patch);
+      expect(rejected.status).toBe(400);
+      expect(rejected.body.error).toBe('voice_bundle_commitment_contract_invalid');
+      expect(transcriptionCalls).toBe(before);
+    }
+  }, 60000);
   it('rejects a fourth Commitment capture whose canonical v2 text does not match', async () => {
     const { token, status } = await registerUser();
     expect(status).toBe(200);

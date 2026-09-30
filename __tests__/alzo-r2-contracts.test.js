@@ -35,6 +35,23 @@ describe('ALZO R2 Final contracts', () => {
     expect(r2.validateCommitmentCapture(null).failureCodes).toContain('commitment_capture_contract_missing');
   });
 
+  test('accepts only the exact approved v2 or v3 Commitment tuple', () => {
+    const v2 = { stage: 'commitment', text: r2.COMMITMENT_TEXT, copyVersion: r2.COMMITMENT_VERSION, copySha256: r2.COMMITMENT_SHA256 };
+    const v3 = { stage: 'commitment', text: r2.COMMITMENT_V3_TEXT, copyVersion: r2.COMMITMENT_V3_VERSION, copySha256: r2.COMMITMENT_V3_SHA256 };
+    expect(r2.sha256(v2.text)).toBe(v2.copySha256);
+    expect(r2.sha256(v3.text)).toBe(v3.copySha256);
+    expect(r2.validateCommitmentCapture(v2).ok).toBe(true);
+    expect(r2.validateCommitmentCapture(v3).ok).toBe(true);
+    for (const invalid of [
+      { ...v2, copyVersion: v3.copyVersion },
+      { ...v2, copySha256: v3.copySha256 },
+      { ...v3, text: v2.text },
+      { ...v3, text: `${v3.text} ` },
+      { ...v3, copySha256: r2.sha256(`${v3.text} `) },
+      { ...v3, copyVersion: 'alzo.commitment.fixed.en.v4' },
+    ]) expect(r2.validateCommitmentCapture(invalid).ok).toBe(false);
+  });
+
   test('Goal is strict while Purpose and Anchor can transcript-mirror', () => {
     const blocked = r2.buildSemanticExtraction({
       goal: { captureId: 'g', transcript: 'Something better.', goalConcrete: false },

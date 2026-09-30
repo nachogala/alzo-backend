@@ -87,20 +87,19 @@ async function probeDurationSec(filePath) {
     }
   }
   // Some ffprobe-static releases have shipped an x86_64 binary inside the
-  // darwin/arm64 path. Measure with ffmpeg's decoded input header instead of
-  // trusting client metadata or weakening the 40-second valid-audio gate.
+  // darwin/arm64 path. The input header rounds duration to centiseconds:
+  // 6.999 seconds appears as 00:00:07.00 and would pass a seven-second gate.
+  // Use the decoded output progress timestamp, which has microsecond
+  // precision, and fail closed if decoding does not finish successfully.
   if (!ffmpegPath) return null;
   const fallback = await run(ffmpegPath, [
-    "-hide_banner", "-i", filePath,
+    "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", filePath,
     "-vn", "-sn", "-dn", "-f", "null", "-",
   ], { timeoutMs: 15000 });
-  const match = String(fallback.stderr).match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-  if (!match) return null;
-  const hours = Number(match[1]);
-  const minutes = Number(match[2]);
-  const seconds = Number(match[3]);
-  const total = hours * 3600 + minutes * 60 + seconds;
-  return Number.isFinite(total) ? total : null;
+  if (fallback.code !== 0 || !/progress=end(?:\r?\n|$)/.test(fallback.stdout)) return null;
+  const samples = [...String(fallback.stdout).matchAll(/^out_time_us=(\d+)$/gm)];
+  const micros = samples.length ? Number(samples[samples.length - 1][1]) : NaN;
+  return Number.isFinite(micros) && micros > 0 ? micros / 1e6 : null;
 }
 
 async function probePeakAmplitude(filePath) {

@@ -1472,6 +1472,20 @@ app.post("/api/onboarding/voice-bundle", uploadCapacityMiddleware(UPLOAD_STORAGE
 
     const transcriptByStage = {};
     const audioFiles = captureSpecs.map((spec) => uploadedFor(spec).path);
+    // Measure the files that arrived, before any paid transcription. Client
+    // timers and rounded metadata are not evidence of seven seconds of audio.
+    const durationGate = await require('./lib/measured-capture-duration-gate').measureAndValidateCaptures(audioFiles, voiceValidator.analyzeFile);
+    if (!durationGate.ok) {
+      audioFiles.forEach((file) => { try { fs.unlinkSync(file); } catch {} });
+      return res.status(422).json({
+        error: 'voice_bundle_capture_duration_invalid',
+        failures: durationGate.failures,
+        minimumDurationMs: durationGate.minimumDurationMs,
+        minimumAggregateMs: durationGate.minimumAggregateMs,
+        requestId,
+        correlationId,
+      });
+    }
     const transcriptions = [];
     const captureReceipt = [];
     const provenanceCaptures = Array.isArray(productProvenance?.captures) ? productProvenance.captures : [];
@@ -1487,8 +1501,7 @@ app.post("/api/onboarding/voice-bundle", uploadCapacityMiddleware(UPLOAD_STORAGE
         failureCodes: commitmentValidation.failureCodes,
         required: {
           stage: 'commitment',
-          copyVersion: alzoR2.COMMITMENT_VERSION,
-          copySha256: alzoR2.COMMITMENT_SHA256,
+          approvedCopies: alzoR2.APPROVED_COMMITMENT_COPIES.map(({ copyVersion, copySha256 }) => ({ copyVersion, copySha256 })),
         },
         requestId,
         correlationId,

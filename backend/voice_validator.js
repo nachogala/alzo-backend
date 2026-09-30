@@ -13,7 +13,7 @@
 //     the orphan voice on ElevenLabs)
 //
 // Decoder: ffmpeg-static counts decoded PCM samples and volumedetect measures
-// peak dB. MP4 presentation duration caps AAC encoder padding. Container
+// peak dB. MP4 audio-track edit timing caps AAC encoder padding. Container
 // headers alone cannot certify truncated audio.
 //
 // The R2 upload gate fails closed when decoding cannot establish duration.
@@ -102,7 +102,7 @@ async function probeDurationSec(filePath) {
   if (decodedDuration == null) return null;
   const mp4Duration = readMp4PresentationDuration(filePath);
   // For M4A, an older ffmpeg may output AAC encoder padding as extra PCM.
-  // The movie presentation duration trims it. Never trust that header alone:
+  // The audio track's media/edit timing trims it. Never trust that header alone:
   // the successful full decode above is required, and we take the lesser.
   if (mp4Duration.isMp4) return mp4Duration.duration == null ? null : Math.min(decodedDuration, mp4Duration.duration);
   return decodedDuration;
@@ -131,17 +131,48 @@ function readMp4PresentationDuration(filePath) {
     }
     return out;
   }
+  const children = (box) => box ? boxes(box.start, box.end) : [];
+  const find = (box, type) => children(box).find((child) => child.type === type);
+  const headerTime = (box) => {
+    if (!box) return null;
+    const version = data[box.start];
+    const offset = box.start + (version === 0 ? 12 : version === 1 ? 20 : 999);
+    const length = version === 0 ? 8 : 12;
+    if (offset + length > box.end) return null;
+    const scale = data.readUInt32BE(offset);
+    const raw = version === 0 ? data.readUInt32BE(offset + 4) : Number(data.readBigUInt64BE(offset + 4));
+    return scale > 0 && Number.isSafeInteger(raw) && raw > 0 ? { scale, raw } : null;
+  };
   const moov = boxes(0, data.length).find((box) => box.type === 'moov');
-  const mvhd = moov && boxes(moov.start, moov.end).find((box) => box.type === 'mvhd');
-  if (!mvhd) return { isMp4: true, duration: null };
-  const version = data[mvhd.start];
-  const offset = mvhd.start + (version === 0 ? 12 : version === 1 ? 20 : 999);
-  const length = version === 0 ? 8 : 12;
-  if (offset + length > mvhd.end) return { isMp4: true, duration: null };
-  const timescale = data.readUInt32BE(offset);
-  const raw = version === 0 ? data.readUInt32BE(offset + 4) : Number(data.readBigUInt64BE(offset + 4));
-  const duration = raw / timescale;
-  return { isMp4: true, duration: timescale > 0 && Number.isSafeInteger(raw) && Number.isFinite(duration) && duration > 0 ? duration : null };
+  const movieTime = headerTime(find(moov, 'mvhd'));
+  if (!movieTime) return { isMp4: true, duration: null };
+  for (const track of children(moov).filter((box) => box.type === 'trak')) {
+    const media = find(track, 'mdia');
+    const handler = find(media, 'hdlr');
+    if (!handler || handler.start + 12 > handler.end || data.toString('ascii', handler.start + 8, handler.start + 12) !== 'soun') continue;
+    const mediaTime = headerTime(find(media, 'mdhd'));
+    const edit = find(find(track, 'edts'), 'elst');
+    if (!mediaTime || !edit || edit.start + 8 > edit.end) return { isMp4: true, duration: null };
+    const version = data[edit.start];
+    const count = data.readUInt32BE(edit.start + 4);
+    // A single active edit identifies the exact playable audio interval.
+    // Multiple edits or an absent edit list cannot safely remove AAC priming
+    // and padding, so the upload gate fails closed.
+    if ((version !== 0 && version !== 1) || count !== 1) return { isMp4: true, duration: null };
+    const offset = edit.start + 8;
+    const width = version === 0 ? 12 : 20;
+    if (offset + width > edit.end) return { isMp4: true, duration: null };
+    const editRaw = version === 0 ? data.readUInt32BE(offset) : Number(data.readBigUInt64BE(offset));
+    const mediaStart = version === 0 ? data.readInt32BE(offset + 4) : Number(data.readBigInt64BE(offset + 8));
+    const rateOffset = offset + (version === 0 ? 8 : 16);
+    const normalRate = data.readInt16BE(rateOffset) === 1 && data.readInt16BE(rateOffset + 2) === 0;
+    if (!normalRate || !Number.isSafeInteger(editRaw) || editRaw <= 0 || !Number.isSafeInteger(mediaStart) || mediaStart < 0 || mediaStart >= mediaTime.raw) return { isMp4: true, duration: null };
+    const editSeconds = editRaw / movieTime.scale;
+    const mediaSeconds = (mediaTime.raw - mediaStart) / mediaTime.scale;
+    const duration = Math.min(editSeconds, mediaSeconds);
+    return { isMp4: true, duration: Number.isFinite(duration) && duration > 0 ? duration : null };
+  }
+  return { isMp4: true, duration: null };
 }
 
 async function probePeakAmplitude(filePath) {

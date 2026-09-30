@@ -586,7 +586,7 @@ describe('TG8 — Sentry breadcrumb coverage', () => {
     await bootServer({ wipeFs: true, wipeDb: true });
   });
 
-  test('TTS fail with cached voice_id emits elevenlabs.* breadcrumb', async () => {
+  test('a legacy cached voice ID without retained owned audio never reaches ElevenLabs', async () => {
     await mockAgent.close();
     mockAgent = mockAgentSetup();
     const pool = mockAgent.get('https://api.elevenlabs.io');
@@ -606,7 +606,7 @@ describe('TG8 — Sentry breadcrumb coverage', () => {
     db.close();
 
     sentryStub._reset();
-    await request(url())
+    const response = await request(url())
       .post('/api/affirmation/today')
       .set('Authorization', `Bearer ${token}`)
       .send({
@@ -616,7 +616,9 @@ describe('TG8 — Sentry breadcrumb coverage', () => {
         timezoneOffsetMinutes: 240,
       });
 
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('SELF_VOICE_SOURCE_MISSING');
     const crumbs = sentryStub.getBreadcrumbs().filter((b) => /^elevenlabs\./.test(b.category || ''));
-    expect(crumbs.length).toBeGreaterThan(0);
+    expect(crumbs).toHaveLength(0);
   });
 });

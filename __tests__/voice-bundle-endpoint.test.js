@@ -17,6 +17,7 @@ const fs = require('fs');
 const os = require('os');
 const net = require('net');
 const crypto = require('crypto');
+const Database = require('better-sqlite3');
 
 const { execFileSync } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
@@ -61,6 +62,7 @@ let serverHarness;
 let mockAgent;
 let elevenState;
 let transcriptionCalls;
+let chatCalls;
 
 function mockAgentSetup() {
   const agent = new MockAgent();
@@ -88,9 +90,9 @@ function installOpenAIMock(agent, { transcriptionDelayMs = 0, transcriptionPlan 
   }
   pool
     .intercept({ path: '/v1/chat/completions', method: 'POST' })
-    .reply(200, {
+    .reply(200, () => { chatCalls += 1; return {
       choices: [{ message: { content: 'I choose the work because my purpose matters to me. I return by remembering what I already named.' } }],
-    })
+    }; })
     .persist();
 }
 
@@ -311,6 +313,7 @@ function actualAac(seconds) {
 
 beforeEach(async () => {
   transcriptionCalls = 0;
+  chatCalls = 0;
   mockAgent = mockAgentSetup();
   installOpenAIMock(mockAgent);
   elevenState = installElevenLabsMock(mockAgent);
@@ -329,6 +332,33 @@ afterAll(() => {
 });
 
 describe('POST /api/onboarding/voice-bundle', () => {
+  it('rejects both Daily routes before text or voice providers when the owned merged source is missing', async () => {
+    const { token, userId, status } = await registerUser();
+    expect(status).toBe(200);
+    const db = new Database(TEST_DB);
+    db.prepare("UPDATE users SET elevenlabsVoiceId = ?, subscriptionStatus = 'trialing' WHERE id = ?").run('legacy_voice_id_without_source', userId);
+    db.close();
+    const dailyContext = {
+      schemaVersion: 'alzo.daily_context.v1',
+      semanticContext: { goal: 'Run', purpose: 'Health', reconnectionAnchor: 'Start small' },
+      sourceRefs: { goal: 'g1', purpose: 'p1', reconnectionAnchor: 'a1' },
+      checkIn: { mood: 'Calm', alignment: 'Connected', alignmentSemantics: 'emotional_connection_only' },
+      checkInRefs: { mood: 'm1', alignment: 'a2' },
+      firstMessageReference: { id: 'first', transcript: 'I can return.', listenedAt: '2026-07-13T00:00:00Z' },
+      recentDailyMessages: [],
+    };
+    for (const [route, body] of [
+      ['/api/daily-message', { context: dailyContext }],
+      ['/api/affirmation/today', { context: dailyContext }],
+    ]) {
+      const response = await request(url()).post(route).set('Authorization', `Bearer ${token}`).send(body);
+      expect(response.status).toBe(409);
+      expect(response.body.code).toBe('SELF_VOICE_SOURCE_MISSING');
+    }
+    expect(chatCalls).toBe(0);
+    expect(elevenState.cloneCalls).toBe(0);
+    expect(elevenState.ttsCalls).toBe(0);
+  });
   it('measures actual AAC content before transcription, including padding and truncation', async () => {
     await bootServer({ realAnalyzer: true });
     const { token, status } = await registerUser();

@@ -2103,8 +2103,9 @@ app.post("/api/daily-message", express.json(), async (req, res) => {
     if (cached) return res.json({ message: { id: cached.id || `daily_${dateKey}`, dateKey, transcript: cached.text, audioUrl: cached.audioUrl, realAudioUrl: cached.audioUrl, voiceMode: cached.voiceMode, cached: true, generationProvenance: boundary.generationProvenance } });
     const cachedVoiceId = stmts.getVoiceId.get(user.id)?.elevenlabsVoiceId || null;
     if (!cachedVoiceId) return res.status(409).json({ error: 'verified_self_voice_required_for_daily', code: 'SELF_VOICE_REQUIRED' });
-    const text = await generateAffirmation(boundary.context, 'en-US', 'daily');
     const retainedMergedVoice = findLatestValidatedR2MergedVoiceForUser(user.id);
+    if (!retainedMergedVoice) return res.status(409).json({ error: 'owned_voice_source_missing_for_daily', code: 'SELF_VOICE_SOURCE_MISSING' });
+    const text = await generateAffirmation(boundary.context, 'en-US', 'daily');
     const reusableVoiceId = verifiedCachedVoiceId(user.id, retainedMergedVoice);
     const cloneResult = await cloneVoiceAndSpeak(text, retainedMergedVoice, null, 'en-US', reusableVoiceId);
     const mode = cloneResult.voiceDebug?.cloneMode;
@@ -2236,6 +2237,8 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
     if (!cachedVoiceId) {
       return res.status(409).json({ error: 'verified_self_voice_required_for_daily', code: 'SELF_VOICE_REQUIRED' });
     }
+    const retainedMergedVoice = findLatestValidatedR2MergedVoiceForUser(user.id);
+    if (!retainedMergedVoice) return res.status(409).json({ error: 'owned_voice_source_missing_for_daily', code: 'SELF_VOICE_SOURCE_MISSING' });
 
     const dailyPrompt = alzoR2.buildDailyPrompt(context);
     Sentry.addBreadcrumb({
@@ -2251,7 +2254,6 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
     });
     const affirmationText = await generateAffirmation(context, language, 'daily');
 
-    const retainedMergedVoice = findLatestValidatedR2MergedVoiceForUser(user.id);
     const cloneResult = await cloneVoiceAndSpeak(
       affirmationText,
       retainedMergedVoice,

@@ -3,7 +3,8 @@
 // voice clone flow. See feature/voice-quality-detector.
 //
 // Capa 1: validate the user's recorded sample BEFORE sending to ElevenLabs.
-//   - Reject if duration < MIN_INPUT_DURATION_S (3s) → VOICE_AUDIO_TOO_SHORT
+//   - The R2 bundle route additionally enforces 7s per take and 40s total
+//     from this analyzer's decoded duration before paid transcription.
 //   - Reject if peak amplitude < MIN_PEAK_AMPLITUDE (0.05) → VOICE_AUDIO_SILENT
 //
 // Capa 2: validate ElevenLabs' first TTS render with the new voice_id.
@@ -11,14 +12,11 @@
 //   - Otherwise the clone is glitched → VOICE_CLONE_GLITCHED (caller cleans up
 //     the orphan voice on ElevenLabs)
 //
-// Decoder: ffmpeg-static + ffprobe-static. ffprobe gives us the duration; we
-// run ffmpeg with `-af volumedetect` to pull the peak dB and convert to a
-// 0-1 linear amplitude. Works for M4A, MP3, WAV, WebM.
+// Decoder: ffmpeg-static counts decoded PCM samples and volumedetect measures
+// peak dB. MP4 presentation duration caps AAC encoder padding. Container
+// headers alone cannot certify truncated audio.
 //
-// Failure-soft: if the binaries are missing or fail to parse the file, we
-// return { ok: true, reason: 'decoder_unavailable' } so the existing flow
-// continues. Better some clones than none — capa 2 still catches glitches via
-// the ElevenLabs response, capa 1 just becomes a no-op until ops add ffmpeg.
+// The R2 upload gate fails closed when decoding cannot establish duration.
 
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -28,9 +26,7 @@ const MIN_TTS_DURATION_S = 4.0;
 const MIN_PEAK_AMPLITUDE = 0.05; // ~ -26 dBFS
 
 let ffmpegPath = null;
-let ffprobePath = null;
 try { ffmpegPath = require("ffmpeg-static"); } catch {}
-try { ffprobePath = require("ffprobe-static")?.path || null; } catch {}
 
 function decoderAvailable() {
   return !!(ffmpegPath && fs.existsSync(ffmpegPath));
@@ -74,32 +70,78 @@ function run(cmd, args, { timeoutMs = 10000 } = {}) {
 }
 
 async function probeDurationSec(filePath) {
-  if (ffprobePath) {
-    const r = await run(ffprobePath, [
-      "-v", "error",
-      "-show_entries", "format=duration",
-      "-of", "default=noprint_wrappers=1:nokey=1",
-      filePath,
-    ]);
-    if (r.code === 0) {
-      const v = parseFloat(String(r.stdout).trim());
-      if (Number.isFinite(v)) return v;
-    }
-  }
-  // Some ffprobe-static releases have shipped an x86_64 binary inside the
-  // darwin/arm64 path. The input header rounds duration to centiseconds:
-  // 6.999 seconds appears as 00:00:07.00 and would pass a seven-second gate.
-  // Use the decoded output progress timestamp, which has microsecond
-  // precision, and fail closed if decoding does not finish successfully.
+  // Container headers can outlive truncated AAC data. ffmpeg progress also
+  // includes encoder padding (6.999 s of speech can report 7.012 s). Count
+  // decoded PCM samples instead: the decoder applies AAC edit-list trim and
+  // discard padding. A failed or interrupted decode never supplies duration.
   if (!ffmpegPath) return null;
-  const fallback = await run(ffmpegPath, [
-    "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", filePath,
-    "-vn", "-sn", "-dn", "-f", "null", "-",
-  ], { timeoutMs: 15000 });
-  if (fallback.code !== 0 || !/progress=end(?:\r?\n|$)/.test(fallback.stdout)) return null;
-  const samples = [...String(fallback.stdout).matchAll(/^out_time_us=(\d+)$/gm)];
-  const micros = samples.length ? Number(samples[samples.length - 1][1]) : NaN;
-  return Number.isFinite(micros) && micros > 0 ? micros / 1e6 : null;
+  const decodedDuration = await new Promise((resolve) => {
+    let bytes = 0;
+    let done = false;
+    let child;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    try {
+      child = spawn(ffmpegPath, [
+        '-hide_banner', '-xerror', '-v', 'error', '-i', filePath,
+        '-map', '0:a:0', '-vn', '-sn', '-dn',
+        '-ac', '1', '-ar', '48000', '-f', 's16le', 'pipe:1',
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (_) { resolve(null); return; }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(null); }, 30000);
+    child.stdout.on('data', (buffer) => { bytes += buffer.length; });
+    // Drain diagnostics without retaining uploaded audio or provider data.
+    child.stderr.on('data', () => {});
+    child.on('error', () => finish(null));
+    child.on('close', (code) => finish(code === 0 && bytes > 0 && bytes % 2 === 0 ? bytes / 2 / 48000 : null));
+  });
+  if (decodedDuration == null) return null;
+  const mp4Duration = readMp4PresentationDuration(filePath);
+  // For M4A, an older ffmpeg may output AAC encoder padding as extra PCM.
+  // The movie presentation duration trims it. Never trust that header alone:
+  // the successful full decode above is required, and we take the lesser.
+  if (mp4Duration.isMp4) return mp4Duration.duration == null ? null : Math.min(decodedDuration, mp4Duration.duration);
+  return decodedDuration;
+}
+
+function readMp4PresentationDuration(filePath) {
+  let data;
+  try { data = fs.readFileSync(filePath); } catch (_) { return { isMp4: false, duration: null }; }
+  if (data.length < 12 || data.toString('ascii', 4, 8) !== 'ftyp') return { isMp4: false, duration: null };
+  function boxes(start, end) {
+    const out = [];
+    for (let pos = start; pos + 8 <= end;) {
+      let size = data.readUInt32BE(pos);
+      const type = data.toString('ascii', pos + 4, pos + 8);
+      let header = 8;
+      if (size === 1) {
+        if (pos + 16 > end) return [];
+        const wide = data.readBigUInt64BE(pos + 8);
+        if (wide > BigInt(Number.MAX_SAFE_INTEGER)) return [];
+        size = Number(wide);
+        header = 16;
+      } else if (size === 0) size = end - pos;
+      if (size < header || pos + size > end) return [];
+      out.push({ type, start: pos + header, end: pos + size });
+      pos += size;
+    }
+    return out;
+  }
+  const moov = boxes(0, data.length).find((box) => box.type === 'moov');
+  const mvhd = moov && boxes(moov.start, moov.end).find((box) => box.type === 'mvhd');
+  if (!mvhd) return { isMp4: true, duration: null };
+  const version = data[mvhd.start];
+  const offset = mvhd.start + (version === 0 ? 12 : version === 1 ? 20 : 999);
+  const length = version === 0 ? 8 : 12;
+  if (offset + length > mvhd.end) return { isMp4: true, duration: null };
+  const timescale = data.readUInt32BE(offset);
+  const raw = version === 0 ? data.readUInt32BE(offset + 4) : Number(data.readBigUInt64BE(offset + 4));
+  const duration = raw / timescale;
+  return { isMp4: true, duration: timescale > 0 && Number.isSafeInteger(raw) && Number.isFinite(duration) && duration > 0 ? duration : null };
 }
 
 async function probePeakAmplitude(filePath) {
@@ -135,7 +177,7 @@ async function analyzeFile(filePath) {
     probeDurationSec(filePath),
     probePeakAmplitude(filePath),
   ]);
-  if (duration == null && peak == null) {
+  if (duration == null) {
     return { ok: false, reason: "decode_failed", duration, peak };
   }
   return { ok: true, reason: null, duration, peak };

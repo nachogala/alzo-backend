@@ -127,7 +127,7 @@ function installElevenLabsMock(agent) {
   return state;
 }
 
-async function bootServer({ preserveStorage = false, semanticResolutionTimeoutMs = null } = {}) {
+async function bootServer({ preserveStorage = false, semanticResolutionTimeoutMs = null, realAnalyzer = false } = {}) {
   if (serverHarness) {
     await serverHarness.close();
     serverHarness = null;
@@ -156,7 +156,8 @@ async function bootServer({ preserveStorage = false, semanticResolutionTimeoutMs
 
   sentryStub._reset();
   jest.resetModules();
-  jest.doMock('../backend/voice_validator', () => ({
+  if (realAnalyzer) jest.dontMock('../backend/voice_validator');
+  else jest.doMock('../backend/voice_validator', () => ({
     validateInputSample: jest.fn(async () => ({ ok: true, soft: false, duration: 40.2, peak: 0.3 })),
     validateTtsRender: jest.fn(async () => ({ ok: true, soft: false, duration: 5.1, peak: 0.25 })),
     analyzeFile: jest.fn(async () => ({ ok: true, reason: null, duration: 40.2, peak: 0.3 })),
@@ -258,7 +259,7 @@ function provenanceCapture(stage, index, suffix = '') {
   };
 }
 
-async function uploadContractBundle(token, suffix = 'lifecycle', commitmentPatch = {}, productProvenanceOverride = null) {
+async function uploadContractBundle(token, suffix = 'lifecycle', commitmentPatch = {}, productProvenanceOverride = null, audioByStage = {}) {
   const bundleId = `bundle_${suffix}_${Date.now()}`;
   const ordered = ['goal', 'purpose', 'reconnectionAnchor', 'commitment'];
   const voiceAttemptIds = ordered.map((stage, index) => `attempt_${suffix}_${index + 1}_${stage}`);
@@ -288,10 +289,24 @@ async function uploadContractBundle(token, suffix = 'lifecycle', commitmentPatch
     .field('productProvenance', JSON.stringify(productProvenance))
     .field('semanticCaptureOrder', JSON.stringify(ordered))
     .field('voiceAttemptIds', JSON.stringify(voiceAttemptIds))
-    .attach('voice_1_goal', audioBuffer(), { filename: 'goal.m4a', contentType: 'audio/mp4' })
-    .attach('voice_2_purpose', audioBuffer(), { filename: 'purpose.m4a', contentType: 'audio/mp4' })
-    .attach('voice_3_reconnectionAnchor', audioBuffer(), { filename: 'reconnectionAnchor.m4a', contentType: 'audio/mp4' })
-    .attach('voice_4_commitment', audioBuffer(), { filename: 'commitment.m4a', contentType: 'audio/mp4' });
+    .attach('voice_1_goal', audioByStage.goal || audioBuffer(), { filename: 'goal.m4a', contentType: 'audio/mp4' })
+    .attach('voice_2_purpose', audioByStage.purpose || audioBuffer(), { filename: 'purpose.m4a', contentType: 'audio/mp4' })
+    .attach('voice_3_reconnectionAnchor', audioByStage.reconnectionAnchor || audioBuffer(), { filename: 'reconnectionAnchor.m4a', contentType: 'audio/mp4' })
+    .attach('voice_4_commitment', audioByStage.commitment || audioBuffer(), { filename: 'commitment.m4a', contentType: 'audio/mp4' });
+}
+
+function actualAac(seconds) {
+  // A host encoder with sample-accurate M4A edit lists is needed for the
+  // 6.999 boundary: some bundled ffmpeg versions round it to exactly 7.000.
+  if (seconds === 6.999 && process.env.ALZO_QA_M4A_SHORT_FILE) {
+    return fs.readFileSync(process.env.ALZO_QA_M4A_SHORT_FILE);
+  }
+  const filename = path.join(TEST_ROOT, `actual-${seconds}-${crypto.randomBytes(4).toString('hex')}.m4a`);
+  execFileSync(ffmpegStatic, [
+    '-v', 'error', '-f', 'lavfi', '-i', `sine=frequency=440:sample_rate=44100:duration=${seconds}`,
+    '-c:a', 'aac', '-movflags', '+faststart', filename,
+  ]);
+  return fs.readFileSync(filename);
 }
 
 beforeEach(async () => {
@@ -314,6 +329,24 @@ afterAll(() => {
 });
 
 describe('POST /api/onboarding/voice-bundle', () => {
+  it('measures actual AAC content before transcription, including padding and truncation', async () => {
+    await bootServer({ realAnalyzer: true });
+    const { token, status } = await registerUser();
+    expect(status).toBe(200);
+    const eleven = actualAac(11);
+    const twenty = actualAac(20);
+    const common = { purpose: eleven, reconnectionAnchor: eleven, commitment: twenty };
+    const short = await uploadContractBundle(token, 'real_aac_6999', {}, null, { ...common, goal: actualAac(6.999) });
+    expect(short.status).toBe(422);
+    expect(transcriptionCalls).toBe(0);
+    const original = actualAac(11);
+    const truncated = await uploadContractBundle(token, 'real_aac_truncated', {}, null, { ...common, goal: original.subarray(0, Math.round(original.length / 3)) });
+    expect(truncated.status).toBe(422);
+    expect(transcriptionCalls).toBe(0);
+    const valid = await uploadContractBundle(token, 'real_aac_7000', {}, null, { ...common, goal: actualAac(7) });
+    expect(valid.status).toBe(200);
+    expect(transcriptionCalls).toBe(4);
+  }, 60000);
   const mobileModule = process.env.ALZO_MOBILE_CONTRACT_MODULE;
   (mobileModule ? it : it.skip)('accepts productProvenance made by the actual mobile bundle module', async () => {
     const mobile = require(mobileModule);
@@ -590,6 +623,39 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(firstMessage.body.voiceDebug?.sampleFiles).toHaveLength(1);
     expect(firstMessage.body.voiceDebug?.sampleFiles?.[0]).toMatch(/merged\.m4a$/);
     expect(firstMessage.body.voiceDebug?.cloneMode).toBe('cloned');
+    expect(firstMessage.body.clone_verified).toBe(true);
+
+    const cloneCallsAfterFirst = elevenState.cloneCalls;
+    const reused = await request(url())
+      .post('/api/generate-affirmation')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ context: res.body.context, sessionId: res.body.sessionId, language: 'en-US' });
+    expect(reused.status).toBe(200);
+    expect(reused.body.clone_verified).toBe(true);
+    expect(reused.body.voiceDebug).toMatchObject({ cloneMode: 'cached', cachedVoiceVerified: true });
+    expect(elevenState.cloneCalls).toBe(cloneCallsAfterFirst);
+
+    // A voice ID with no verified account/asset receipt is legacy unknown.
+    const Database = require('better-sqlite3');
+    const db = new Database(TEST_DB);
+    db.prepare('UPDATE users SET elevenlabsVoiceProofSha256 = NULL WHERE id = ?').run(userId);
+    db.close();
+    const legacy = await request(url())
+      .post('/api/generate-affirmation')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ context: res.body.context, sessionId: res.body.sessionId, language: 'en-US' });
+    expect(legacy.status).toBe(200);
+    expect(legacy.body.voiceDebug?.cloneMode).toBe('cloned');
+    expect(elevenState.cloneCalls).toBe(cloneCallsAfterFirst + 1);
+
+    require('../backend/voice_validator').validateTtsRender.mockResolvedValueOnce({ ok: false, code: 'VOICE_CLONE_GLITCHED', http: 502, duration: 1, peak: 0.2 });
+    const badCachedRender = await request(url())
+      .post('/api/generate-affirmation')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ context: res.body.context, sessionId: res.body.sessionId, language: 'en-US' });
+    expect(badCachedRender.status).toBe(502);
+    expect(badCachedRender.body.clone_verified).not.toBe(true);
+    expect(elevenState.cloneCalls).toBe(cloneCallsAfterFirst + 1);
   }, 30000);
 
   it('enforces voiceOwnerId and recovers the validated merged artifact after process restart', async () => {
@@ -635,6 +701,23 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(fs.existsSync(mergedPath)).toBe(true);
     expect(fs.existsSync(manifestPath)).toBe(true);
     expect(manifest.sourceCaptureFiles.every((filePath) => fs.existsSync(filePath))).toBe(true);
+
+    const intruderOwn = await uploadContractBundle(intruder.token, 'intruder_own');
+    expect(intruderOwn.status).toBe(200);
+    const Database = require('better-sqlite3');
+    const db = new Database(TEST_DB);
+    const ownerVoice = db.prepare('SELECT elevenlabsVoiceId, elevenlabsVoiceProofSha256, elevenlabsVoiceVerifiedAt FROM users WHERE id = ?').get(owner.userId);
+    db.prepare('UPDATE users SET elevenlabsVoiceId = ?, elevenlabsVoiceProofSha256 = ?, elevenlabsVoiceVerifiedAt = ? WHERE id = ?')
+      .run(ownerVoice.elevenlabsVoiceId, ownerVoice.elevenlabsVoiceProofSha256, ownerVoice.elevenlabsVoiceVerifiedAt, intruder.userId);
+    db.close();
+    const beforeCrossAccountClone = elevenState.cloneCalls;
+    const intruderFirst = await request(url())
+      .post('/api/generate-affirmation')
+      .set('Authorization', `Bearer ${intruder.token}`)
+      .send({ context: intruderOwn.body.context, sessionId: intruderOwn.body.sessionId, language: 'en-US' });
+    expect(intruderFirst.status).toBe(200);
+    expect(intruderFirst.body.voiceDebug?.cloneMode).toBe('cloned');
+    expect(elevenState.cloneCalls).toBe(beforeCrossAccountClone + 1);
 
     fs.unlinkSync(mergedPath);
     const missingArtifact = await request(url())

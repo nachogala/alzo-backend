@@ -32,6 +32,8 @@ const fs = require('fs');
 const os = require('os');
 const net = require('net');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+const ffmpegStatic = require('ffmpeg-static');
 const { MockAgent, setGlobalDispatcher, fetch: undiciFetch, Headers: UndiciHeaders, Request: UndiciRequest, Response: UndiciResponse, FormData: UndiciFormData } = require('undici');
 const request = require('supertest');
 const { r2SemanticContext, uploadR2VoiceBundle } = require('./helpers/r2-voice-bundle');
@@ -229,6 +231,15 @@ function silentMp3Buffer() {
   );
 }
 
+let verifiedTtsFixture;
+function verifiedTtsBuffer() {
+  if (!verifiedTtsFixture) verifiedTtsFixture = execFileSync(ffmpegStatic, [
+    '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=4.5',
+    '-c:a', 'libmp3lame', '-f', 'mp3', 'pipe:1',
+  ]);
+  return Buffer.from(verifiedTtsFixture);
+}
+
 // ── ElevenLabs mock state ─────────────────────────────────────────────────────
 function installElevenLabsMock(agent, { ivcExpired = false, captureCallCount = false } = {}) {
   const pool = agent.get('https://api.elevenlabs.io');
@@ -254,10 +265,10 @@ function installElevenLabsMock(agent, { ivcExpired = false, captureCallCount = f
       if (ivcExpired && voiceId.startsWith('expired_')) {
         return { statusCode: 404, data: 'voice not found' };
       }
-      // Return a tiny valid mp3 byte stream
+      // Return a decodable, audible render so the real post-TTS validator runs.
       return {
         statusCode: 200,
-        data: silentMp3Buffer(),
+        data: verifiedTtsBuffer(),
         responseOptions: { headers: { 'content-type': 'audio/mpeg' } },
       };
     })
@@ -390,7 +401,7 @@ describe('TG2 — Voice survives ElevenLabs IVC expiry (re-clone path)', () => {
     // Re-arm mock with IVC-expired profile; voice_ids prefixed "expired_" 404 on TTS+GET
     await mockAgent.close();
     mockAgent = mockAgentSetup();
-    installElevenLabsMock(mockAgent, { ivcExpired: true });
+    const ivcMock = installElevenLabsMock(mockAgent, { ivcExpired: true });
     installOpenAIMock(mockAgent);
     await bootServer({ wipeFs: true, wipeDb: true });
 
@@ -409,9 +420,9 @@ describe('TG2 — Voice survives ElevenLabs IVC expiry (re-clone path)', () => {
     db.close();
 
     // Now ask for today's affirmation. POST-FIX EXPECTATION:
-    //   - Server tries TTS with cached `expired_*` id → 404 from mock
-    //   - Server clears the stale id, re-clones from saved samples (POST /v1/voices/add)
-    //   - Server retries TTS with the NEW id → 200
+    //   - Legacy `expired_*` id has no owner/asset verification receipt, so
+    //     it is never reused or sent to TTS.
+    //   - Server re-clones from the retained validated sample.
     //   - Server persists the new voice_id
     const res = await request(url())
       .post('/api/affirmation/today')
@@ -425,6 +436,7 @@ describe('TG2 — Voice survives ElevenLabs IVC expiry (re-clone path)', () => {
     expect(res.status).toBe(200);
     expect(res.body.audioUrl).toBeTruthy();
     expect(res.body.voiceMode).toBe('recloned');
+    expect(ivcMock.lastTtsVoiceId).not.toMatch(/^expired_/);
 
     // Confirm the user row now holds a non-expired voice_id
     const db2 = new Database(TEST_DB);

@@ -181,6 +181,8 @@ try { db.exec("ALTER TABLE plants ADD COLUMN color TEXT DEFAULT '#6B4EFF'"); } c
 try { db.exec("ALTER TABLE users ADD COLUMN notificationHour INTEGER DEFAULT 7"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN notificationMinute INTEGER DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN elevenlabsVoiceId TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN elevenlabsVoiceProofSha256 TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN elevenlabsVoiceVerifiedAt INTEGER"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN stripeCustomerId TEXT"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN stripeSubscriptionId TEXT"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN subscriptionStatus TEXT DEFAULT 'none'"); } catch {}
@@ -264,9 +266,10 @@ const stmts = {
   updateToken: db.prepare("UPDATE users SET token = ? WHERE email = ?"),
   updatePlan: db.prepare("UPDATE users SET plan = ? WHERE email = ?"),
   updateNotification: db.prepare("UPDATE users SET notificationHour = ?, notificationMinute = ? WHERE id = ?"),
-  getVoiceId: db.prepare("SELECT elevenlabsVoiceId FROM users WHERE id = ?"),
+  getVoiceId: db.prepare("SELECT id, elevenlabsVoiceId, elevenlabsVoiceProofSha256, elevenlabsVoiceVerifiedAt FROM users WHERE id = ?"),
   getAllVoiceIds: db.prepare("SELECT elevenlabsVoiceId FROM users WHERE elevenlabsVoiceId IS NOT NULL"),
-  setVoiceId: db.prepare("UPDATE users SET elevenlabsVoiceId = ? WHERE id = ?"),
+  setVoiceId: db.prepare("UPDATE users SET elevenlabsVoiceId = ?, elevenlabsVoiceProofSha256 = NULL, elevenlabsVoiceVerifiedAt = NULL WHERE id = ?"),
+  setVerifiedVoice: db.prepare("UPDATE users SET elevenlabsVoiceId = ?, elevenlabsVoiceProofSha256 = ?, elevenlabsVoiceVerifiedAt = ? WHERE id = ?"),
   getAffirmationByDate: db.prepare("SELECT * FROM affirmations WHERE userId = ? AND dateKey = ?"),
   insertAffirmation: db.prepare("INSERT INTO affirmations (id, userId, dateKey, text, audioUrl, voiceMode) VALUES (?, ?, ?, ?, ?, ?)"),
   countUsers: db.prepare("SELECT COUNT(*) AS n FROM users"),
@@ -760,6 +763,32 @@ async function evictOldestOrphanVoice() {
   }
 }
 
+function voiceSampleSha256(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  try { return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex'); } catch { return null; }
+}
+
+function voiceProofSha256(userId, voiceId, sampleHash) {
+  return crypto.createHash('sha256').update(['alzo.verified_voice.v1', String(userId), 'elevenlabs', String(voiceId), String(sampleHash)].join('\0')).digest('hex');
+}
+
+function verifiedCachedVoiceId(userId, sourcePath) {
+  const row = userId ? stmts.getVoiceId.get(userId) : null;
+  const sampleHash = voiceSampleSha256(sourcePath);
+  // Existing legacy IDs have no proof. A provider ID alone never proves that
+  // the requested account and current merged voice asset own that clone.
+  return row?.id === userId && row.elevenlabsVoiceId && row.elevenlabsVoiceVerifiedAt
+    && sampleHash && row.elevenlabsVoiceProofSha256 === voiceProofSha256(userId, row.elevenlabsVoiceId, sampleHash)
+    ? row.elevenlabsVoiceId : null;
+}
+
+function rememberVerifiedVoice(userId, voiceId, sourcePath, voiceDebug) {
+  const sampleHash = voiceSampleSha256(sourcePath);
+  if (!userId || !voiceId || !sampleHash || voiceDebug?.cloneVerified !== true || voiceDebug?.validatorSoft === true) return false;
+  stmts.setVerifiedVoice.run(voiceId, voiceProofSha256(userId, voiceId, sampleHash), Math.floor(Date.now() / 1000), userId);
+  return true;
+}
+
 async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existingVoiceId = null) {
   const voiceFiles = (Array.isArray(voiceFilePath) ? voiceFilePath : [voiceFilePath]).filter(Boolean);
   const debug = {
@@ -803,7 +832,24 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
         });
         return { audioUrl: null, voiceDebug: debug, voiceId: existingVoiceId };
       }
+      const reuseValidation = speech.localFilePath
+        ? await voiceValidator.validateTtsRender(speech.localFilePath)
+        : { ok: false, reason: 'cached_render_file_missing' };
+      if (!reuseValidation.ok || reuseValidation.soft === true) {
+        try { if (speech.localFilePath) fs.unlinkSync(speech.localFilePath); } catch {}
+        debug.cloneMode = 'cached_render_unverified';
+        debug.error = 'cached voice render could not be verified';
+        debug.errorCode = 'VOICE_CLONE_GLITCHED';
+        debug.errorHttp = 502;
+        debug.fallbackBlocked = true;
+        debug.staleCachedVoiceId = existingVoiceId;
+        return { audioUrl: null, voiceDebug: debug, voiceId: null };
+      }
       debug.modelId = speech.modelId;
+      debug.cloneVerified = true;
+      debug.cachedVoiceVerified = true;
+      debug.validatorDuration = reuseValidation.duration;
+      debug.validatorPeak = reuseValidation.peak;
       recordVoiceMetric('tts_reused_cached_voice', { voiceId: existingVoiceId, language, modelId: speech.modelId });
       return { audioUrl: speech.audioUrl, voiceDebug: debug, voiceId: existingVoiceId };
     } catch (err) {
@@ -967,10 +1013,10 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
     // ── Capa 2: post-clone TTS render validator ─────────────────────
     // ElevenLabs sometimes returns a voice_id whose first synth is silence
     // or a 1s glitch. Verify the rendered MP3 is at least 4s of real audio
-    // before handing the voice to the user. Failure-soft if decoder unavail.
+    // before handing the voice to the user. Decoder uncertainty fails closed.
     Sentry.setTag('voice_validator_step', 'post_clone');
     const v2 = await voiceValidator.validateTtsRender(speech.localFilePath);
-    if (!v2.ok) {
+    if (!v2.ok || v2.soft === true) {
       // Clean up: delete the bad voice from ElevenLabs AND the bad MP3 from
       // disk so it can never be served, then surface a structured error so
       // the caller returns 502 VOICE_CLONE_GLITCHED.
@@ -980,9 +1026,9 @@ async function cloneVoiceAndSpeak(text, voiceFilePath, gender, language, existin
       debug.error = `clone glitched (duration=${v2.duration}s peak=${v2.peak})`;
       debug.fallbackBlocked = true;
       debug.cloneVerified = false;
-      debug.errorCode = v2.code;
-      debug.errorHttp = v2.http;
-      debug.errorMessage = v2.message;
+      debug.errorCode = v2.code || 'VOICE_CLONE_GLITCHED';
+      debug.errorHttp = v2.http || 502;
+      debug.errorMessage = v2.message || 'The generated voice could not be verified.';
       debug.validatorDuration = v2.duration;
       debug.validatorPeak = v2.peak;
       recordVoiceMetric('clone_glitched', { level: 'error', voiceId: voice_id, language, duration: v2.duration, peak: v2.peak });
@@ -1955,13 +2001,14 @@ app.post("/api/generate-affirmation", express.json(), async (req, res) => {
         } catch {}
         // Keep manifest so subsequent daily affirmations can reuse samples
       }
-      const cloneResult = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language, cachedVoiceId);
+      const reusableVoiceId = verifiedCachedVoiceId(authedUser.id, voicePath);
+      const cloneResult = await cloneVoiceAndSpeak(affirmationText, voiceArg, gender, language, reusableVoiceId);
       audioUrl = cloneResult.audioUrl;
       synthesizedAudioPath = cloneResult.localFilePath || null;
       voiceDebug = cloneResult.voiceDebug;
       // Persist the new voice_id so the next affirmation skips the clone step.
-      if (authedUser && cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
-        stmts.setVoiceId.run(cloneResult.voiceId, authedUser.id);
+      if (authedUser && cloneResult.voiceId && cloneResult.voiceDebug?.cloneMode === 'cloned') {
+        rememberVerifiedVoice(authedUser.id, cloneResult.voiceId, voicePath, cloneResult.voiceDebug);
       } else if (authedUser && cachedVoiceId && cloneResult.voiceDebug?.staleCachedVoiceId && !cloneResult.voiceId) {
         stmts.setVoiceId.run(null, authedUser.id);
         recordVoiceMetric('stale_cached_voice_cleared', { userId: authedUser.id, voiceId: cachedVoiceId, endpoint: 'generate_affirmation' });
@@ -2058,10 +2105,11 @@ app.post("/api/daily-message", express.json(), async (req, res) => {
     if (!cachedVoiceId) return res.status(409).json({ error: 'verified_self_voice_required_for_daily', code: 'SELF_VOICE_REQUIRED' });
     const text = await generateAffirmation(boundary.context, 'en-US', 'daily');
     const retainedMergedVoice = findLatestValidatedR2MergedVoiceForUser(user.id);
-    const cloneResult = await cloneVoiceAndSpeak(text, retainedMergedVoice, null, 'en-US', cachedVoiceId);
+    const reusableVoiceId = verifiedCachedVoiceId(user.id, retainedMergedVoice);
+    const cloneResult = await cloneVoiceAndSpeak(text, retainedMergedVoice, null, 'en-US', reusableVoiceId);
     const mode = cloneResult.voiceDebug?.cloneMode;
     if (!cloneResult.audioUrl || !['cached', 'cloned'].includes(mode)) return res.status(502).json({ error: 'daily_self_voice_tts_failed', voiceDebug: cloneResult.voiceDebug });
-    if (cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) stmts.setVoiceId.run(cloneResult.voiceId, user.id);
+    if (cloneResult.voiceId && mode === 'cloned') rememberVerifiedVoice(user.id, cloneResult.voiceId, retainedMergedVoice, cloneResult.voiceDebug);
     const id = crypto.randomBytes(12).toString('hex');
     try {
       stmts.insertAffirmation.run(id, user.id, dateKey, text, cloneResult.audioUrl, mode);
@@ -2209,13 +2257,13 @@ app.post("/api/affirmation/today", express.json(), async (req, res) => {
       retainedMergedVoice,
       detectedGender,
       language,
-      cachedVoiceId,
+      verifiedCachedVoiceId(user.id, retainedMergedVoice),
     );
     const dailyVoiceMode = cloneResult.voiceDebug?.cloneMode;
-    const validCachedTts = dailyVoiceMode === 'cached';
-    const validStaleReclone = dailyVoiceMode === 'cloned' && cloneResult.voiceDebug?.staleVoiceReclone === true;
-    if (cloneResult.voiceId && cloneResult.voiceId !== cachedVoiceId) {
-      stmts.setVoiceId.run(cloneResult.voiceId, user.id);
+    const validCachedTts = dailyVoiceMode === 'cached' && cloneResult.voiceDebug?.cachedVoiceVerified === true;
+    const validStaleReclone = dailyVoiceMode === 'cloned' && cloneResult.voiceDebug?.cloneVerified === true;
+    if (cloneResult.voiceId && dailyVoiceMode === 'cloned') {
+      rememberVerifiedVoice(user.id, cloneResult.voiceId, retainedMergedVoice, cloneResult.voiceDebug);
     } else if (cloneResult.voiceDebug?.staleCachedVoiceId && !cloneResult.voiceId) {
       stmts.setVoiceId.run(null, user.id);
     }

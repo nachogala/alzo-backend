@@ -5,8 +5,8 @@
  * (branch qa/voice-structural-fixes-b52):
  *
  *   (a) /api/generate-affirmation MUST NOT return audioUrl:null when the
- *       ElevenLabs clone fails for a non-glitch reason — it must degrade
- *       gracefully to the preset-voice fallback (matches /api/affirmation/today).
+ *       ElevenLabs clone fails for a non-glitch reason — onboarding must fail
+ *       closed rather than treating a preset fallback as verified self voice.
  *
  *   (b) cloneVoiceAndSpeak MUST evict the oldest orphan / non-owner cloned
  *       voice and retry once when /v1/voices/add returns a slot-ceiling 422,
@@ -25,6 +25,8 @@ const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
 const net  = require('net');
+const { execFileSync } = require('child_process');
+const ffmpegStatic = require('ffmpeg-static');
 
 const {
   MockAgent,
@@ -137,11 +139,15 @@ async function bootServer() {
 
 function url() { return `http://127.0.0.1:${serverHarness.port}`; }
 
-function silentMp3Buffer() {
-  return Buffer.from(
-    '/+MYxAAAAANIAAAAAExBTUUzLjk5cgQAAAAAAAAAABRAJAaUQAAQAAAAEi4i',
-    'base64'
-  );
+let syntheticTtsBuffer;
+function syntheticTtsAudio() {
+  if (!syntheticTtsBuffer) {
+    const file = path.join(TEST_ROOT, 'synthetic-provider-tone.mp3');
+    execFileSync(ffmpegStatic, ['-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=5', '-c:a', 'libmp3lame', file]);
+    syntheticTtsBuffer = fs.readFileSync(file);
+  }
+  return Buffer.from(syntheticTtsBuffer);
 }
 
 async function registerUser(
@@ -197,7 +203,7 @@ describe('FIX (a) — /api/generate-affirmation self-voice failure guard', () =>
       .reply(500, { detail: 'internal error' }).persist();
     // Preset fallback TTS (textToSpeechFallback) must still succeed.
     el.intercept({ path: /^\/v1\/text-to-speech\/[^/]+/, method: 'POST' })
-      .reply(() => ({ statusCode: 200, data: silentMp3Buffer(),
+      .reply(() => ({ statusCode: 200, data: syntheticTtsAudio(),
         responseOptions: { headers: { 'content-type': 'audio/mpeg' } } })).persist();
     el.intercept({ path: /^\/v1\/voices\/[^/]+$/, method: 'DELETE' })
       .reply(200, { ok: true }).persist();
@@ -259,7 +265,7 @@ describe('FIX (b) — cloneVoiceAndSpeak deterministic voice-slot eviction', () 
       .reply((opts) => { deleted.push(opts.path.split('/').pop()); return { statusCode: 200, data: { ok: true } }; })
       .persist();
     el.intercept({ path: /^\/v1\/text-to-speech\/[^/]+/, method: 'POST' })
-      .reply(() => ({ statusCode: 200, data: silentMp3Buffer(),
+      .reply(() => ({ statusCode: 200, data: syntheticTtsAudio(),
         responseOptions: { headers: { 'content-type': 'audio/mpeg' } } })).persist();
     installOpenAIMock(mockAgent);
 
@@ -284,5 +290,6 @@ describe('FIX (b) — cloneVoiceAndSpeak deterministic voice-slot eviction', () 
     // End state: usable audio either from the successful retry or, worst case,
     // the fix-(a) fallback guard — never null.
     expect(aff.body.audioUrl).toBeTruthy();
+    expect(aff.body.clone_verified).toBe(true);
   }, 30000);
 });

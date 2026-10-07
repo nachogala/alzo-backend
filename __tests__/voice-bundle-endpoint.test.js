@@ -96,8 +96,15 @@ function installOpenAIMock(agent, { transcriptionDelayMs = 0, transcriptionPlan 
     .persist();
 }
 
+let syntheticTtsBuffer;
 function audioResponseBuffer() {
-  return Buffer.from('/+MYxAAAAANIAAAAAExBTUUzLjk5cgQAAAAAAAAAABRAJAaUQAAQAAAAEi4i', 'base64');
+  if (!syntheticTtsBuffer) {
+    const file = path.join(TEST_ROOT, 'synthetic-tts.mp3');
+    execFileSync(ffmpegStatic, ['-y', '-v', 'error', '-f', 'lavfi', '-i',
+      'sine=frequency=440:duration=5', '-c:a', 'libmp3lame', file]);
+    syntheticTtsBuffer = fs.readFileSync(file);
+  }
+  return Buffer.from(syntheticTtsBuffer);
 }
 
 function installElevenLabsMock(agent) {
@@ -332,6 +339,81 @@ afterAll(() => {
 });
 
 describe('POST /api/onboarding/voice-bundle', () => {
+  (process.env.ALZO_QA_APPLE_AAC_DIR && process.env.ALZO_MOBILE_CONTRACT_MODULE ? it : it.skip)('real mobile adapter and state recover from HTTP422 through generation, readable playback and Home reopen', async () => {
+    await bootServer({ realAnalyzer: true });
+    const mobile = path.dirname(process.env.ALZO_MOBILE_CONTRACT_MODULE);
+    const {createMockApi} = require(path.join(mobile, 'mockApi'));
+    const {createAlzo2BackendAdapter} = require(path.join(mobile, 'alzo2BackendAdapter'));
+    const {COMMITMENT_TEXT} = require(path.join(mobile, 'onboardingCopy'));
+    const {currentUploadFailure} = require(path.join(mobile, 'voiceUploadRecovery'));
+    const {createMemoryPersistenceAdapter} = require(path.join(mobile, 'persistenceRuntime'));
+    const {createV2Envelope} = require(path.join(mobile, 'persistedStateSchema'));
+    const {selectCanonicalFirstMessage} = require(path.join(mobile, 'firstMessageAuthority'));
+    const {resolveInitialRouteId} = require(path.join(mobile, 'routeResolution'));
+    mockAgent.get('https://api.elevenlabs.io').intercept({path:'/v1/voices',method:'GET'}).reply(200,{voices:[]}).persist();
+    const adapter=createAlzo2BackendAdapter({baseUrl:url(),fetch:async(target,options={})=>{
+      // MockAgent's localhost passthrough cannot stream FormData reliably.
+      // Serialize the adapter's actual multipart body without changing fields.
+      if(options.body instanceof UndiciFormData){
+        const encoded=new UndiciRequest(target,options);
+        options={...options,headers:Object.fromEntries(encoded.headers),body:Buffer.from(await encoded.arrayBuffer())};
+      }
+      try{return await undiciFetch(target,options);}catch(error){throw new Error(String(error.cause?.message||error.message));}
+    }});
+    const api=createMockApi({backendAuthAdapter:adapter});
+    api.postOnboardingDraft({category:'health'});
+    for(const stage of ['goal','purpose','resistance','commitmentReading']) {
+      const seconds=stage==='commitmentReading'?20:11;
+      const file=path.join(process.env.ALZO_QA_APPLE_AAC_DIR,seconds+'.m4a');
+      const capture=api.postSemanticVoiceCapture({stage,uri:'file://'+file,durationSeconds:seconds,durationMs:seconds*1000,
+        semanticValue:stage==='commitmentReading'?COMMITMENT_TEXT:'',transcript:null,
+        semanticStatus:'backend_transcription_pending',requiresBackendValidation:true,microphoneWorking:true,
+        signalClass:'artifact_requires_backend_transcription',voiceAttemptId:'http_oct7_'+stage,
+        artifactProbe:{uriPresent:true,fileExists:true,fileSizeBytes:fs.statSync(file).size,probeError:null},fileSizeBytes:fs.statSync(file).size});
+      expect(capture.ok).toBe(true);
+    }
+    expect((await api.postEmailSignIn({email:'http-integration@example.test',password:'test-pass-1234'})).ok).toBe(true);
+    const bundle=api.getPreAccountVoiceBundleStatus().bundle;
+    const ids=Object.values(api.getState().onboarding.semanticCaptures).map(item=>item.captureId);
+    const journey=api.postPreAccountVoiceBundleJourney({bundle});
+    expect(journey.ok).toBe(true);
+    expect((await api.postDailyDeliveryTime({time:'08:00',timezone:'America/New_York'})).ok).toBe(true);
+    expect(api.postPlantSelection(journey.journey.id,{plantChoiceId:'vds_sprout_quiet',name:'Synthetic integration'}).ok).toBe(true);
+    const fileBlob=(name)=>({blob:new Blob([fs.readFileSync(path.join(process.env.ALZO_QA_APPLE_AAC_DIR,name))],{type:'audio/mp4'})});
+    const files={goal:fileBlob('11.m4a'),purpose:fileBlob('11.m4a'),reconnectionAnchor:fileBlob('11.m4a'),commitment:fileBlob('20.m4a')};
+    const bad=await api.postPreAccountVoiceProcessingPayload({bundle,files:{...files,goal:fileBlob('6.999.m4a')}});
+    if(bad.status!==422) throw new Error('expected HTTP422: '+JSON.stringify({error:bad.error,stage:bad.stage,status:bad.status}));
+    expect(bad.status).toBe(422);
+    expect(currentUploadFailure(api.getState()).failures[0]).toMatchObject({stage:'goal',code:'capture_duration_short'});
+    expect(api.postOnboardingComplete({}).ok).toBe(false);
+    expect(transcriptionCalls).toBe(0);
+    expect(elevenState.cloneCalls).toBe(0);
+    const good=await api.postPreAccountVoiceProcessingPayload({bundle,files});
+    if(!good.ok) throw new Error('mobile HTTP retry: '+JSON.stringify({error:good.error,stage:good.stage,raw:good.raw}));
+    expect(currentUploadFailure(api.getState())).toBeNull();
+    expect(Object.values(api.getState().onboarding.semanticCaptures).map(item=>item.captureId)).toEqual(ids);
+    expect(transcriptionCalls).toBe(4);
+    expect(elevenState.cloneCalls).toBe(1);
+    const message=selectCanonicalFirstMessage(api.getState());
+    expect(message).toBeTruthy();
+    const audio=await undiciFetch(new URL(message.audioUrl,url()));
+    expect(audio.status).toBe(200);
+    const played=path.join(TEST_ROOT,'playback.mp3');
+    fs.writeFileSync(played,Buffer.from(await audio.arrayBuffer()));
+    expect((await require('../backend/voice_validator').analyzeFile(played)).duration).toBeGreaterThanOrEqual(4);
+    expect(api.postOnboardingComplete({}).ok).toBe(true);
+    // Assembly reconciles the canonical message ID. The rendered app selects
+    // from the new snapshot, so playback must use that current identity too.
+    const activeMessage=selectCanonicalFirstMessage(api.getState());
+    const playback=api.postMessagePlayback(activeMessage.id,'completed',{source:'playback_completed'});
+    if(!playback.ok)throw new Error('mobile playback: '+JSON.stringify({error:playback.error,detail:playback.detail,provenance:message.audioProvenance,audioKind:message.audioKind,cloneMode:message.voiceDebug?.cloneMode}));
+    expect(api.activateJourneyAfterFirstMessage().ok).toBe(true);
+    expect(resolveInitialRouteId(api.getState())).toBe('home');
+    const reopened=createMockApi({persistenceAdapter:createMemoryPersistenceAdapter(createV2Envelope(api.getState())),backendAuthAdapter:adapter});
+    expect((await reopened.hydrate()).ok).toBe(true);
+    expect(resolveInitialRouteId(reopened.getState())).toBe('home');
+    expect(Object.values(reopened.getState().onboarding.semanticCaptures).map(item=>item.captureId)).toEqual(ids);
+  },60000);
   (process.env.ALZO_QA_APPLE_AAC_DIR ? it : it.skip)('accepts CoreAudio AAC without edits and rejects short/truncated files before providers', async () => {
     await bootServer({ realAnalyzer: true });
     const { token } = await registerUser();

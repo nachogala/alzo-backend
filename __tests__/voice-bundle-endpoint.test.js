@@ -396,6 +396,11 @@ describe('POST /api/onboarding/voice-bundle', () => {
     expect(elevenState.cloneCalls).toBe(1);
     const message=selectCanonicalFirstMessage(api.getState());
     expect(message).toBeTruthy();
+    const {privacyHash}=require(path.join(mobile,'firstMessageContextProof'));
+    const resolved=good.upload.semanticContext;
+    expect(message.contextProof.goal.valueHash).toBe(privacyHash(resolved.goal.text));
+    expect(message.contextProof.purpose.valueHash).toBe(privacyHash(resolved.purpose.text));
+    expect(message.contextProof.reconnectionAnchor.valueHash).toBe(privacyHash(resolved.reconnectionAnchor.text));
     const audio=await undiciFetch(new URL(message.audioUrl,url()));
     expect(audio.status).toBe(200);
     const played=path.join(TEST_ROOT,'playback.mp3');

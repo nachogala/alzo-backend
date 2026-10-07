@@ -1522,6 +1522,14 @@ app.post("/api/onboarding/voice-bundle", uploadCapacityMiddleware(UPLOAD_STORAGE
     // timers and rounded metadata are not evidence of seven seconds of audio.
     const durationGate = await require('./lib/measured-capture-duration-gate').measureAndValidateCaptures(audioFiles, voiceValidator.analyzeFile);
     if (!durationGate.ok) {
+      // Only measured metadata: never audio, transcripts, email or tokens.
+      const diagnostic = { requestId, correlationId, failures: durationGate.failures, measuredDurationsMs: durationGate.measuredDurationsMs.map((value) => Number.isFinite(value) ? value : null), captureCount: audioFiles.length };
+      console.warn('[voice_bundle.duration_rejected]', JSON.stringify(diagnostic));
+      Sentry.withScope((scope) => {
+        scope.setTag('flow', 'onboarding_voice_bundle');
+        scope.setContext('voice_duration_gate', diagnostic);
+        Sentry.captureMessage('voice_bundle.duration_rejected', 'warning');
+      });
       audioFiles.forEach((file) => { try { fs.unlinkSync(file); } catch {} });
       return res.status(422).json({
         error: 'voice_bundle_capture_duration_invalid',

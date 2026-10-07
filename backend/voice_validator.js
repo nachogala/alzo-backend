@@ -146,22 +146,68 @@ function readMp4PresentationDuration(filePath) {
   const moov = boxes(0, data.length).find((box) => box.type === 'moov');
   const movieTime = headerTime(find(moov, 'mvhd'));
   if (!movieTime) return { isMp4: true, duration: null };
+  // CoreAudio writes gapless AAC timing in the scoped iTunes freeform item
+  // instead of an edit list. Never infer priming from a filename/header.
+  const appleGaplessSamples = (media, mediaTime) => {
+    const table = find(find(media, 'minf'), 'stbl');
+    const stts = find(table, 'stts');
+    if (!stts || stts.start + 8 > stts.end) return null;
+    const count = data.readUInt32BE(stts.start + 4);
+    if (count < 1 || stts.start + 8 + count * 8 !== stts.end) return null;
+    let sampleTicks = 0;
+    for (let i = 0; i < count; i++) {
+      const offset = stts.start + 8 + i * 8;
+      sampleTicks += data.readUInt32BE(offset) * data.readUInt32BE(offset + 4);
+      if (!Number.isSafeInteger(sampleTicks)) return null;
+    }
+    if (sampleTicks !== mediaTime.raw) return null;
+    const metadata = find(find(moov, 'udta'), 'meta');
+    const ilst = metadata && boxes(metadata.start + 4, metadata.end).find((box) => box.type === 'ilst');
+    const matches = [];
+    for (const item of children(ilst).filter((box) => box.type === '----')) {
+      const mean = find(item, 'mean');
+      const name = find(item, 'name');
+      const value = find(item, 'data');
+      if (!mean || !name || !value) continue;
+      if (data.toString('utf8', mean.start + 4, mean.end) !== 'com.apple.iTunes'
+        || data.toString('utf8', name.start + 4, name.end) !== 'iTunSMPB') continue;
+      if (value.start + 8 > value.end || data.readUInt32BE(value.start) !== 1) return null;
+      const fields = data.toString('ascii', value.start + 8, value.end).trim().split(/\s+/);
+      if (fields.length < 4 || !fields.slice(0, 4).every((field) => /^[0-9a-f]+$/i.test(field))) return null;
+      const [reserved, priming, padding, playable] = fields.slice(0, 4).map((field) => Number(BigInt(`0x${field}`)));
+      if (![reserved, priming, padding, playable].every(Number.isSafeInteger)
+        || reserved !== 0 || playable <= 0 || priming + padding + playable !== sampleTicks) return null;
+      matches.push(playable);
+    }
+    return matches.length === 1 ? matches[0] : null;
+  };
   for (const track of children(moov).filter((box) => box.type === 'trak')) {
     const media = find(track, 'mdia');
     const handler = find(media, 'hdlr');
     if (!handler || handler.start + 12 > handler.end || data.toString('ascii', handler.start + 8, handler.start + 12) !== 'soun') continue;
     const mediaTime = headerTime(find(media, 'mdhd'));
     const edit = find(find(track, 'edts'), 'elst');
-    if (!mediaTime || !edit || edit.start + 8 > edit.end) return { isMp4: true, duration: null };
+    if (!mediaTime) return { isMp4: true, duration: null };
+    if (!edit) {
+      const samples = appleGaplessSamples(media, mediaTime);
+      return { isMp4: true, duration: samples == null ? null : samples / mediaTime.scale };
+    }
+    if (edit.start + 8 > edit.end) return { isMp4: true, duration: null };
     const version = data[edit.start];
     const count = data.readUInt32BE(edit.start + 4);
-    // A single active edit identifies the exact playable audio interval.
-    // Multiple edits or an absent edit list cannot safely remove AAC priming
-    // and padding, so the upload gate fails closed.
-    if ((version !== 0 && version !== 1) || count !== 1) return { isMp4: true, duration: null };
-    const offset = edit.start + 8;
+    // A leading empty edit describes a timeline gap, not audible samples.
+    // FFmpeg emits it when merging CoreAudio files. Accept only this pattern
+    // or a single active edit; never count gaps towards the voice minimum.
+    if ((version !== 0 && version !== 1) || (count !== 1 && count !== 2)) return { isMp4: true, duration: null };
     const width = version === 0 ? 12 : 20;
-    if (offset + width > edit.end) return { isMp4: true, duration: null };
+    let offset = edit.start + 8;
+    if (offset + width * count !== edit.end) return { isMp4: true, duration: null };
+    if (count === 2) {
+      const gapStart = version === 0 ? data.readInt32BE(offset + 4) : Number(data.readBigInt64BE(offset + 8));
+      const rateOffset = offset + (version === 0 ? 8 : 16);
+      if (gapStart !== -1 || data.readInt16BE(rateOffset) !== 1 || data.readInt16BE(rateOffset + 2) !== 0) return { isMp4: true, duration: null };
+      offset += width;
+    }
     const editRaw = version === 0 ? data.readUInt32BE(offset) : Number(data.readBigUInt64BE(offset));
     const mediaStart = version === 0 ? data.readInt32BE(offset + 4) : Number(data.readBigInt64BE(offset + 8));
     const rateOffset = offset + (version === 0 ? 8 : 16);

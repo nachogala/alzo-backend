@@ -332,6 +332,24 @@ afterAll(() => {
 });
 
 describe('POST /api/onboarding/voice-bundle', () => {
+  (process.env.ALZO_QA_APPLE_AAC_DIR ? it : it.skip)('accepts CoreAudio AAC without edits and rejects short/truncated files before providers', async () => {
+    await bootServer({ realAnalyzer: true });
+    const { token } = await registerUser();
+    const read = (name) => fs.readFileSync(path.join(process.env.ALZO_QA_APPLE_AAC_DIR, name));
+    const common = { purpose: read('11.m4a'), reconnectionAnchor: read('11.m4a'), commitment: read('20.m4a') };
+    for (const filename of ['6.999.m4a', 'truncated.m4a', 'unknown-priming.m4a']) {
+      const rejected = await uploadContractBundle(token, `apple_${filename}`, {}, null, { ...common, goal: read(filename) });
+      expect(rejected.status).toBe(422);
+      expect(transcriptionCalls).toBe(0);
+      expect(chatCalls).toBe(0);
+      expect(elevenState.cloneCalls).toBe(0);
+      expect(elevenState.ttsCalls).toBe(0);
+    }
+    const accepted = await uploadContractBundle(token, 'apple_exact7', {}, null, { ...common, goal: read('7.m4a') });
+    if (accepted.status !== 200) throw new Error(JSON.stringify(accepted.body));
+    expect(accepted.status).toBe(200);
+    expect(transcriptionCalls).toBe(4);
+  }, 60000);
   it('rejects both Daily routes before text or voice providers when the owned merged source is missing', async () => {
     const { token, userId, status } = await registerUser();
     expect(status).toBe(200);
